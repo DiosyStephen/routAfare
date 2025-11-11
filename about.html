@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>About — Busly</title>
+  <meta name="description" content="About Busly — the Bus Fare Predictor and Calculator by Team Xterminate" />
+
+  <style>
+    :root {
+      --bg:#f7fafc; --card:#ffffff; --muted:#6b7280; --accent:#0ea5a4; --accent-2:#0369a1;
+      --radius:12px;
+      font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0;
+      background:linear-gradient(180deg,#eef2f7 0%,var(--bg) 100%);
+      color:#0f172a;
+      line-height:1.6;
+    }
+
+    .container{max-width:900px;margin:32px auto;padding:20px}
+
+    header{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px}
+    .brand{display:flex;gap:12px;align-items:center}
+    .logo{width:48px;height:48px;border-radius:10px;overflow:hidden;}
+    .logo img{width:100%;height:100%;object-fit:contain;border-radius:10px}
+    .title{font-size:1.25rem;font-weight:700}
+    nav a{margin-left:14px;color:var(--muted);text-decoration:none;font-weight:600}
+    nav a:hover{color:var(--accent-2)}
+    nav a.active{color:var(--accent-2);font-weight:700}
+
+    .card{
+      background:var(--card);
+      border-radius:var(--radius);
+      padding:24px;
+      box-shadow:0 6px 18px rgba(2,6,23,0.06);
+    }
+
+    h1{margin-top:0;font-size:1.6rem}
+    h2{margin-top:20px;color:var(--accent-2)}
+    p{color:#334155;margin:12px 0;line-height:1.7}
+    ul{margin:10px 0 10px 20px}
+
+    footer{
+      margin-top:24px;
+      text-align:center;
+      color:var(--muted);
+      font-size:0.9rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="brand">
+        <div class="logo">
+          <img src="LOGO_01.png" alt="Busly logo">
+        </div>
+        <div>
+          <div class="title">Busly</div>
+          <div class="small">Bus Fare Predictor and Calculator</div>
+        </div>
+      </div>
+      <nav aria-label="Main navigation">
+        <a href="busly.html">Home</a>
+        <a href="about.html" class="active">About</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="card">
+        <h1>About Busly</h1>
+        <p><strong>Busly</strong> is a modern bus fare calculator and prediction system designed to improve the fairness and transparency of private bus fare payments across Sri Lanka. Developed by <strong>Team Xterminate</strong> from Lyceum International School, the project combines technology, data science, and accessibility to create a smarter transport experience for everyone.</p>
+
+        <h2>Background</h2>
+        <p>Many passengers face difficulties negotiating bus fares with conductors on private buses. Prices often vary for the same routes, leading to frustration and disputes. Busly addresses this issue by introducing a reliable system that predicts accurate and fair bus fares using data and machine learning.</p>
+
+        <h2>Project Summary</h2>
+        <p>The project developed a <strong>crowdsourced bus fare predictor app</strong> using <strong>Telegram</strong> as the main user interface. It integrates a <strong>machine learning algorithm</strong> built in <strong>Python</strong> to calculate estimated fares for any given route. The backend system is powered by the latest Python libraries and frameworks, ensuring accuracy and performance.</p>
+
+        <h2>Objectives</h2>
+        <ul>
+          <li>Develop a working calculator and predictor to estimate bus fares.</li>
+          <li>Promote fairness in private bus transactions and reduce fare disputes.</li>
+          <li>Build a user-friendly beta version of the app.</li>
+          <li>Expand the system to be used island-wide.</li>
+        </ul>
+
+        <h2>Methodology</h2>
+        <p>The project began by collecting a dataset of bus fares from the <strong>Kurunegala</strong> region. Various <strong>Machine Learning models</strong> were tested — including <em>Linear Regression</em> and <em>Gradient Boosting</em> — to find the most accurate predictor. The team used <strong>Flask</strong> to integrate the <strong>Telegram API</strong> with the backend, allowing seamless real-time interactions with users.</p>
+
+        <h3>Tools & Technologies</h3>
+        <ul>
+          <li>Python</li>
+          <li>Flask</li>
+          <li>Google Colab</li>
+          <li>Excel (for dataset preparation)</li>
+          <li>National Transport Commission (NTC) data</li>
+        </ul>
+
+        <h2>Team Xterminate</h2>
+        <p><strong>Team Xterminate</strong> consists of four dedicated members from Lyceum International School who worked collaboratively to bring Busly to life:</p>
+        <ul>
+          <li><strong>Dinuth</strong> — Data Engineer, in charge of data gathering, preprocessing, and ensuring prediction accuracy, Core Reasearcher on ML models. </li>
+          <li><strong>Azan</strong> — Lead UI/UX Designer, focused on the app’s interface, ensuring a clean and user-friendly experience.</li>
+          <li><strong>Hasindu</strong> — Sub UI/UX Designer, Sub Reasearcher on ML models.</li>
+          <li><strong>Poojana</strong> — Presenter, Website Developer.</li>
+        </ul>
+        <p>Together, the team combined their strengths in programming, design, and coordination to build a functional and innovative transport solution.</p>
+
+        <h2>Future Goals</h2>
+        <ul>
+          <li>Expand the dataset to include routes across the entire island.</li>
+          <li>Gather new data through surveys to improve model precision.</li>
+          <li>Upgrade from a Telegram bot to a standalone mobile application.</li>
+          <li>Encourage nationwide adoption for fairer and smarter public transport.</li>
+        </ul>
+
+        <h2>Our Vision</h2>
+        <p>Busly aims to transform how passengers engage with public transport by ensuring transparent and data-driven fare calculations. With community support and advanced technology, we aim to make every ride fair, efficient, and stress-free.</p>
+
+      </section>
+    </main>
+
+    <footer>
+      © 2025 Busly — By Team Xterminate | Ride Smart, Pay Fair
+    </footer>
+  </div>
+</body>
+</html>
+
