@@ -1,3 +1,4 @@
+#V2🥲
 import os
 import json
 from google.oauth2 import service_account
@@ -506,6 +507,7 @@ if __name__ == '__main__':
 
     # If running under Gunicorn/Render, the Procfile should start the app (e.g. gunicorn "routAfare_bot_fixed:app")
     print('Ready. If running locally uncomment app.run(...) in __main__.')
+
 
 
 
