@@ -224,11 +224,11 @@ VERTEX_CONFIG = {
     'location': os.getenv('VERTEX_AI_LOCATION')
 }
 
+# Original
 vertex_predictor = None
 if aiplatform and all(VERTEX_CONFIG.values()):
     try:
-        aiplatform.init(project=VERTEX_CONFIG['project'], location=VERTEX_CONFIG['location'])
-        endpoint_name = VERTEX_CONFIG['endpoint_id'].split('/')[-1]
+        # ... (initialization code)
         vertex_predictor = aiplatform.Endpoint(endpoint_name=endpoint_name)
         print(f"✅ Vertex AI Predictor initialized for endpoint: {endpoint_name}")
     except Exception as e:
@@ -236,6 +236,10 @@ if aiplatform and all(VERTEX_CONFIG.values()):
         vertex_predictor = None
 else:
     print("Vertex AI not configured or not installed. Predictions will not be available.")
+
+# MODIFICATION: Force vertex_predictor to None to activate the fallback
+# Rerun this modification on Render:
+# vertex_predictor = None
 
 # --- Bot Initialization & Core Functions ---
 if not BOT_TOKEN:
@@ -514,6 +518,7 @@ if __name__ == '__main__':
 
     # If running under Gunicorn/Render, the Procfile should start the app (e.g. gunicorn "routAfare_bot_fixed:app")
     print('Ready.')
+
 
 
 
