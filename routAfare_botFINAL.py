@@ -376,7 +376,12 @@ def handle_text_message(message):
         for bus in matching:
             keyboard.add(InlineKeyboardButton(f"{bus['id']} — departures: {', '.join(bus['times'][:3])}...", callback_data=f"bus_{bus['id']}"))
 
-        bot.send_message(chat_id, f"🚌 *Predicted Fare:* Rs. {s_data['predicted_fare']}\n\nSelect a bus:", parse_mode='Markdown', reply_markup=keyboard)
+        #bot.send_message(chat_id, f"🚌 *Predicted Fare:* Rs. {s_data['predicted_fare']}\n\nSelect a bus:", parse_mode='Markdown', reply_markup=keyboard)
+
+        fare_text = f"🚌 *Predicted Fare:* Rs\. {s_data['predicted_fare']}\n\nSelect a bus:"
+        
+        bot.send_message(chat_id, fare_text, parse_mode='Markdown', reply_markup=keyboard)
+        
         sessions[str_chat_id]['step'] = 'await_bus_select'
         save_sessions()
         return
@@ -509,6 +514,7 @@ if __name__ == '__main__':
 
     # If running under Gunicorn/Render, the Procfile should start the app (e.g. gunicorn "routAfare_bot_fixed:app")
     print('Ready.')
+
 
 
 
