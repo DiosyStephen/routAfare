@@ -178,7 +178,7 @@ def load_bus_data(csv_file_path):
     unique_bus_cols = [c for c in ['route_id', 'bus_route', 'bus_type_num', 'direction'] if c in df.columns]
 
     if not unique_bus_cols:
-        print("CRITICAL: CSV missing expected columns like 'route_id' or 'bus_route'. Available columns:", list(df.columns)))
+        print("CRITICAL: CSV missing expected columns like 'route_id' or 'bus_route'")
         return []
 
     df_unique = df.groupby(unique_bus_cols).agg(
@@ -525,6 +525,7 @@ if __name__ == '__main__':
 
     # If running under Gunicorn/Render, the Procfile should start the app (e.g. gunicorn "routAfare_bot_fixed:app")
     print('Ready.')
+
 
 
 
