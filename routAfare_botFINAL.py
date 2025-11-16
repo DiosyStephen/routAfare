@@ -491,22 +491,25 @@ def set_initial_webhook():
     except Exception as e:
         print(f"FATAL: Failed to set webhook. Error: {e}")
         # Don't exit — let hosting platform decide
+
 # ---------------- RENDER STARTUP HOOK ----------------
 
-# Make webhook initialize automatically under Gunicorn/Render
+# Move the webhook call out of the __main__ block
+if bot is not None:
+    set_initial_webhook()
 
 # ------------------------------------------------------
 
-
 if __name__ == '__main__':
     print('Starting routAfare Bot...')
-    set_initial_webhook()
+    #set_initial_webhook()
 
     # For local testing, start Flask directly (uncomment when testing locally):
     # app.run(host='0.0.0.0', port=SERVER_PORT)
 
     # If running under Gunicorn/Render, the Procfile should start the app (e.g. gunicorn "routAfare_bot_fixed:app")
-    print('Ready. If running locally uncomment app.run(...) in __main__.')
+    print('Ready.')
+
 
 
 
