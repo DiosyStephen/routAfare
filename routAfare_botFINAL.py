@@ -317,6 +317,13 @@ def handle_text_message(message):
 
     # --- Start flow ---
     if not session['step'] and lc in ('ser', 'search'):
+        
+        if not ROUTE_NAMES:
+            bot.send_message(chat_id, "❌ No routes are loaded on the server. Please contact the admin.")
+            # Clear session to prevent getting stuck
+            clear_session(chat_id) 
+            return # Exit function if no routes are available
+            
         sessions[str_chat_id] = {
             'step': 'await_route_name',
             'data': {},
@@ -324,9 +331,9 @@ def handle_text_message(message):
         }
         save_sessions()
 
-        if not ROUTE_NAMES:
-            bot.send_message(chat_id, "No routes are loaded on the server. Please contact the admin.")
-            return
+        #if not ROUTE_NAMES:
+            #bot.send_message(chat_id, "No routes are loaded on the server. Please contact the admin.")
+            #return
 
         keyboard = InlineKeyboardMarkup()
         for r in ROUTE_NAMES:
@@ -518,6 +525,7 @@ if __name__ == '__main__':
 
     # If running under Gunicorn/Render, the Procfile should start the app (e.g. gunicorn "routAfare_bot_fixed:app")
     print('Ready.')
+
 
 
 
