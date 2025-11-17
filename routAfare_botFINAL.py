@@ -292,10 +292,22 @@ def get_fare_prediction_safe(data, predictor):
     except Exception as e:
         raise RuntimeError(f"Vertex AI Prediction failed: {e}")
 
+
 # --- Message and Callback Handlers ---
 @bot.message_handler(commands=['start', 'help'])
 def handle_commands(message):
-    bot.send_message(message.chat.id, "Welcome! Type *ser* or *search* to start.", parse_mode='Markdown')
+    # Updated message to include the support phone number
+    welcome_message = (
+        "👋 Welcome! Type ser or search to start a route search.\n\n"
+        "📞 For further queries, please call: 0785716262"
+    )
+    bot.send_message(message.chat.id, welcome_message, parse_mode='Markdown')
+
+# --- Message and Callback Handlers ---
+
+#@bot.message_handler(commands=['start', 'help'])
+#def handle_commands(message):
+ #   bot.send_message(message.chat.id, "Welcome! Type *ser* or *search* to start.", parse_mode='Markdown')
 
 
 @bot.message_handler(func=lambda msg: True, content_types=['text'])
@@ -525,6 +537,7 @@ if __name__ == '__main__':
 
     # If running under Gunicorn/Render, the Procfile should start the app (e.g. gunicorn "routAfare_bot_fixed:app")
     print('Ready.')
+
 
 
 
