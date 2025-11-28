@@ -363,9 +363,7 @@ def handle_text(message):
         save_sessions()
         return
 
-    # NOTE: The previous fallback message has been removed.
-    # The bot will now ignore text input if the current 'step' does not match any
-    # of the expected input steps above.
+    # No generic fallback message here. Unrecognized text input is simply ignored.
 
 # --- CALLBACK QUERY HANDLER (The Core UI Logic) ---
 
