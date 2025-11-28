@@ -1,7 +1,9 @@
-python-dotenv
-Flask
-pyTelegramBotAPI
-pandas
-google-cloud-aiplatform
-google-auth
-gunicorn
+Flask==2.3.3
+gunicorn==20.1.0
+pyTelegramBotAPI==4.12.0
+pandas==2.0.3
+python-dotenv==1.0.0
+# The Google Cloud libraries are included here just in case 
+# you plan to implement the fare prediction model later:
+google-cloud-aiplatform==1.31.0
+google-auth==2.22.0
