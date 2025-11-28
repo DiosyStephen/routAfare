@@ -54,16 +54,10 @@ DEFAULT_DISTANCE_KM = 5.0
 # --- Data Persistence Helpers ---
 def safe_write_json(file_path, data):
     try:
-        # Prevent RecursionError during write by setting depth=1
-        if sys.getrecursionlimit() < 1000 and len(str(data)) > 10000:
-             # This is a safeguard, but standard dumps should work if recursion is fixed
-             pass 
-        
         os.makedirs(os.path.dirname(file_path) or '.', exist_ok=True)
         with open(file_path, 'w', encoding='utf8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        # Added detailed logging for persistence errors
         print(f"Error writing {file_path}: {e}")
 
 def safe_read_json(file_path, fallback):
@@ -369,8 +363,9 @@ def handle_text(message):
         save_sessions()
         return
 
-    bot.send_message(int(chat_id), "Type something or use /start to restart the menu.")
-
+    # NOTE: The previous fallback message has been removed.
+    # The bot will now ignore text input if the current 'step' does not match any
+    # of the expected input steps above.
 
 # --- CALLBACK QUERY HANDLER (The Core UI Logic) ---
 
@@ -585,9 +580,4 @@ if bot is not None:
 
 if __name__ == '__main__':
     print('Starting RoutAfare Bot FINAL...')
-    # Use gunicorn as shown in your logs if running outside of a gunicorn entry point
-    # Note: If running this file directly (python routAfare_botFINAL.py), you'd use app.run()
-    # For deployment environments like Render/Heroku, the Gunicorn command handles the start.
     print('Ready.')
-    # The actual launch is handled by the Gunicorn command specified in your logs:
-    # gunicorn routAfare_botFINAL:app --bind 0.0.0.0:$PORT
