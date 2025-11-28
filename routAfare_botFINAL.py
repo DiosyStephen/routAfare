@@ -81,7 +81,7 @@ def clear_session(chat_id):
         del sessions[str(chat_id)]
         save_sessions()
 
-# --- CSV & Data Loading (Same as V4) ---
+# --- CSV & Data Loading ---
 
 def time_to_minutes(t: str):
     m = re.match(r'^(\d{1,2}):(\d{2})$', t)
@@ -143,7 +143,6 @@ def get_all_routes():
 
 buses = load_bus_data(CSV_FILE_PATH)
 ROUTE_NAMES = get_all_routes()
-# ... [Other constant definitions] ...
 
 
 # --- Vertex AI/Fare Prediction (Fallback only for this example) ---
@@ -163,7 +162,7 @@ def get_fare_prediction_safe(data, predictor):
 # --- Bot Initialization ---
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False) if BOT_TOKEN else None
 
-# --- KEYBOARDS & UI HELPERS (Same as V4) ---
+# --- KEYBOARDS & UI HELPERS ---
 
 def main_menu_keyboard():
     markup = InlineKeyboardMarkup(row_width=2)
@@ -238,7 +237,6 @@ def handle_text(message):
     # --- PROVIDER ADDING DATA FLOW ---
     elif step == 'prov_enter_route':
         sessions[chat_id]['temp_service']['route'] = text
-        # --- NEW STEP FOR SERVICE NAME ---
         sessions[chat_id]['step'] = 'prov_enter_service_name' 
         save_sessions()
         bot.send_message(int(chat_id), "🚍 Enter the **Bus Service/Company Name** (e.g., ABC Express, Private Bus):")
@@ -247,7 +245,7 @@ def handle_text(message):
         sessions[chat_id]['temp_service']['service_name'] = text
         sessions[chat_id]['step'] = 'prov_enter_driver'
         save_sessions()
-        bot.send_message(int(chat_id), "👤 Enter **Driver Name**:")
+        bot.send_message(int(chat_id), "🧑 Enter **Driver Name**:")
 
     elif step == 'prov_enter_driver':
         sessions[chat_id]['temp_service']['driver'] = text
@@ -380,13 +378,12 @@ def handle_query(call):
                               reply_markup=reply_markup, parse_mode='Markdown')
         bot.answer_callback_query(call.id)
 
-    # --- 1. MAIN MENU/ROLES (Same as V4) ---
+    # --- 1. MAIN MENU/ROLES ---
     if data == "menu_main":
         clear_session(chat_id)
         edit_and_answer("👋 **Welcome to RoutAfare!**\n\nPlease select your role:", main_menu_keyboard())
 
     elif data == "role_passenger":
-        # ... [Route selection logic remains the same] ...
         routes = get_all_routes()
         if not routes:
             bot.answer_callback_query(call.id, "No routes available. Contact the admin.")
@@ -427,7 +424,7 @@ def handle_query(call):
         edit_and_answer("⏰ Enter your departure time in **HH:MM** (example: 13:45):")
 
     elif data.startswith("confirm_"):
-        # --- NEW BOOKING CONFIRMATION STEP ---
+        # --- BOOKING CONFIRMATION STEP ---
         bus_id = data.replace('confirm_', '', 1)
         found_buses = sessions[chat_id].get('found_buses', {})
         selected_bus = found_buses.get(bus_id)
@@ -451,7 +448,7 @@ def handle_query(call):
         clear_session(chat_id)
         return
 
-    # --- 3. PROVIDER MENU FLOW (Same as V4) ---
+    # --- 3. PROVIDER MENU FLOW ---
     elif data == "prov_add":
         sessions[chat_id]['step'] = 'prov_enter_route'
         sessions[chat_id]['temp_service'] = {}
