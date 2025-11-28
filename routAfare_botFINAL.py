@@ -2,8 +2,8 @@
 """
 routAfare_botFINAL.py
 Final Integrated Version: Includes Role-based Menus, Combined Data Search, 
-Bus Service Name Input, Final Booking Confirmation, and fix for RecursionError 
-in Provider Status Toggle.
+Bus Service Name Input, Final Booking Confirmation, fix for RecursionError 
+in Provider Status Toggle, AND SECURE VERTEX AI INITIALIZATION.
 """
 
 import os
@@ -21,13 +21,16 @@ try:
     from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
     import pandas as pd
     
-    # Vertex AI / Google Cloud Imports (kept for context)
+    # Vertex AI / Google Cloud Imports
     try:
         from google.cloud import aiplatform
         from google.oauth2 import service_account
+        # Check if necessary libraries are available
+        GCP_LIBRARIES_AVAILABLE = True
     except ImportError:
         aiplatform = None
         service_account = None
+        GCP_LIBRARIES_AVAILABLE = False
 
 except ImportError as e:
     print(f"CRITICAL: Missing required package. Error: {e}")
@@ -145,16 +148,58 @@ buses = load_bus_data(CSV_FILE_PATH)
 ROUTE_NAMES = get_all_routes()
 
 
-# --- Vertex AI/Fare Prediction (Fallback only for this example) ---
-vertex_predictor = None # Assumed not initialized for simplicity
+# --- Vertex AI/Fare Prediction Initialization ---
+GCP_PROJECT_ID = os.getenv('GCP_PROJECT_ID')
+GCP_LOCATION = os.getenv('GCP_LOCATION')
+VERTEX_ENDPOINT_ID = os.getenv('VERTEX_ENDPOINT_ID')
+CREDENTIALS_JSON = os.getenv('GOOGLE_CREDENTIALS_JSON')
+
+vertex_predictor = None
+
+if GCP_LIBRARIES_AVAILABLE and all([GCP_PROJECT_ID, GCP_LOCATION, VERTEX_ENDPOINT_ID, CREDENTIALS_JSON]):
+    try:
+        # Load credentials from the secure JSON string environment variable
+        credentials_info = json.loads(CREDENTIALS_JSON)
+        credentials = service_account.Credentials.from_service_account_info(credentials_info)
+        
+        # Initialize the Vertex AI client and endpoint
+        aiplatform.init(project=GCP_PROJECT_ID, location=GCP_LOCATION, credentials=credentials)
+        
+        # This object is what we call to get predictions
+        vertex_predictor = aiplatform.Endpoint(endpoint_name=VERTEX_ENDPOINT_ID) 
+        
+        print("✅ Vertex AI Prediction Endpoint Initialized.")
+
+    except Exception as e:
+        print(f"❌ Error initializing Vertex AI. Falling back to local calculation. Error: {e}")
+        vertex_predictor = None # Ensure predictor is None on failure
+
 
 def get_fare_prediction_safe(data, predictor):
-    # This is a fallback calculation
-    try: distance_km = float(data.get('distance_km', DEFAULT_DISTANCE_KM))
-    except Exception: distance_km = DEFAULT_DISTANCE_KM
+    # This is a fallback calculation if Vertex AI fails or is not configured
+    try: 
+        distance_km = float(data.get('distance_km', DEFAULT_DISTANCE_KM))
+        traffic_level_num = int(data.get('traffic_level_num', 1))
+    except Exception: 
+        distance_km = DEFAULT_DISTANCE_KM
+        traffic_level_num = 1
+        
+    if predictor:
+        try:
+            # Example structure for calling Vertex AI (needs exact input schema)
+            # input_instance = [{"distance_km": distance_km, "traffic_level": traffic_level_num, "hour": int(data['time'].split(':')[0])}]
+            # prediction = predictor.predict(instances=input_instance)
+            # return prediction.predictions[0] 
+            
+            # For now, return a placeholder based on fallback for simplicity until schema is known
+            print("NOTE: Using fallback calculation even with predictor initialized.")
+            pass 
+        except Exception as e:
+            print(f"Vertex AI Prediction failed: {e}")
+
     base = 20.0
     per_km = 5.0
-    traffic_mult = 1.0 + (0.1 * int(data.get('traffic_level_num', 1)))
+    traffic_mult = 1.0 + (0.1 * traffic_level_num)
     fare = max(5.0, round((base + distance_km * per_km) * traffic_mult, 2))
     return fare
 
@@ -290,6 +335,7 @@ def handle_text(message):
         save_sessions()
 
         try:
+            # Use the integrated fare prediction function
             predicted_fare = get_fare_prediction_safe(sessions[chat_id]['data'], vertex_predictor)
             sessions[chat_id]['data']['predicted_fare'] = predicted_fare
             save_sessions()
@@ -363,7 +409,7 @@ def handle_text(message):
         save_sessions()
         return
 
-    # No generic fallback message here. Unrecognized text input is simply ignored.
+    # Unrecognized text input is simply ignored.
 
 # --- CALLBACK QUERY HANDLER (The Core UI Logic) ---
 
@@ -419,6 +465,7 @@ def handle_query(call):
         sessions[chat_id]['data']['passengers'] = count
         sessions[chat_id]['step'] = 'await_time'
         sessions[chat_id]['data']['distance_km'] = DEFAULT_DISTANCE_KM
+        sessions[chat_id]['data']['traffic_level_num'] = 1 # Placeholder for model
         save_sessions()
         edit_and_answer("⏰ Enter your departure time in **HH:MM** (example: 13:45):")
 
@@ -554,13 +601,13 @@ def webhook():
 
 @app.route('/', methods=['GET'])
 def index():
-    return 'RoutAfare Bot FINAL Running', 200
+    status = "Vertex AI Initialized" if vertex_predictor else "Using Local Fallback"
+    return f'RoutAfare Bot FINAL Running. Status: {status}', 200
 
 def set_initial_webhook():
     if bot is None: return
     full_webhook_url = f"{WEBHOOK_URL_BASE}{WEBHOOK_URL_PATH}"
     try:
-        # It's good practice to get the current webhook info before removing/setting
         current_webhook = bot.get_webhook_info()
         if current_webhook.url != full_webhook_url:
             bot.remove_webhook()
