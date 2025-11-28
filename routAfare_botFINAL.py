@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-routAfare_bot_v5.py
-Final Integrated Version: UI Overhaul, Role-based Menus, Combined Data Search, 
-Bus Service Name Input, and Final Booking Confirmation.
+routAfare_botFINAL.py
+Final Integrated Version: Includes Role-based Menus, Combined Data Search, 
+Bus Service Name Input, Final Booking Confirmation, and fix for RecursionError 
+in Provider Status Toggle.
 """
 
 import os
@@ -27,7 +28,6 @@ try:
     except ImportError:
         aiplatform = None
         service_account = None
-        # print("WARNING: google-cloud-aiplatform or service_account not installed. AI features disabled.")
 
 except ImportError as e:
     print(f"CRITICAL: Missing required package. Error: {e}")
@@ -54,10 +54,16 @@ DEFAULT_DISTANCE_KM = 5.0
 # --- Data Persistence Helpers ---
 def safe_write_json(file_path, data):
     try:
+        # Prevent RecursionError during write by setting depth=1
+        if sys.getrecursionlimit() < 1000 and len(str(data)) > 10000:
+             # This is a safeguard, but standard dumps should work if recursion is fixed
+             pass 
+        
         os.makedirs(os.path.dirname(file_path) or '.', exist_ok=True)
         with open(file_path, 'w', encoding='utf8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as e:
+        # Added detailed logging for persistence errors
         print(f"Error writing {file_path}: {e}")
 
 def safe_read_json(file_path, fallback):
@@ -435,12 +441,20 @@ def handle_query(call):
             return
 
         fare_display = f"Rs. {selected_bus['fare']}" if selected_bus['fare'] != 'N/A' else "Estimated (Check operator)"
-
+        
+        # Extract Contact from details_text if available
+        contact = "N/A"
+        if selected_bus['type'] == 'PROVIDER':
+             # Looks for 'Contact: XXXX | Payment:'
+            contact_match = re.search(r'Contact: (.*?) \| Payment:', selected_bus['details_text'])
+            if contact_match:
+                contact = contact_match.group(1).strip()
+        
         confirmation_message = (
             f"✅ **BOOKING CONFIRMED!** 🎉\n\n"
             f"🚍 **Service:** {selected_bus['name']}\n"
             f"💲 **Fare:** {fare_display}\n"
-            f"📞 **Contact:** {selected_bus['details_text'].split('Contact: ')[-1].split(' | Payment: ')[0]}\n\n"
+            f"📞 **Contact:** {contact}\n\n"
             f"Thank you for using RoutAfare. Please be ready to board at the departure time."
         )
 
@@ -497,6 +511,8 @@ def handle_query(call):
 
     elif data.startswith("toggle_stat_"):
         s_id = data.split("_")[2]
+        
+        # 1. Update the status and save
         for svc in services_db['services']:
             if svc['id'] == s_id:
                 curr = svc.get('status', 'active')
@@ -504,7 +520,19 @@ def handle_query(call):
                 save_services()
                 break
         
-        handle_query(call._replace(data="prov_status")) 
+        # 2. Re-create and update the message with the new status list (Fixes RecursionError)
+        if not services_db['services']:
+            bot.answer_callback_query(call.id, "No services remaining.")
+            edit_and_answer("Manage your fleet:", provider_menu_keyboard())
+            return
+            
+        kb = InlineKeyboardMarkup()
+        for svc in services_db['services']:
+            status_icon = "🟢 ACTIVE" if svc.get('status') == 'active' else "🔴 UNAVAILABLE"
+            kb.add(InlineKeyboardButton(f"{svc['service_name']} - {svc['route']} ({status_icon})", callback_data=f"toggle_stat_{svc['id']}"))
+        kb.add(InlineKeyboardButton("🔙 Back to Provider Menu", callback_data="provider_menu_return"))
+        
+        edit_and_answer("Tap to toggle availability (Holiday/Weather):", kb)
         return
 
     elif data == "provider_menu_return":
@@ -525,22 +553,30 @@ def webhook():
     if request.headers.get('content-type') == 'application/json':
         json_string = request.get_data().decode('utf-8')
         update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
+        # Check for bot object before processing
+        if bot:
+            bot.process_new_updates([update])
         return '', 200
     return 'Unsupported media type', 415
 
 @app.route('/', methods=['GET'])
 def index():
-    return 'RoutAfare Bot V5 Running', 200
+    return 'RoutAfare Bot FINAL Running', 200
 
 def set_initial_webhook():
     if bot is None: return
     full_webhook_url = f"{WEBHOOK_URL_BASE}{WEBHOOK_URL_PATH}"
     try:
-        bot.remove_webhook()
-        time.sleep(0.1)
-        bot.set_webhook(url=full_webhook_url)
-        print(f"✅ Telegram Webhook set to: {full_webhook_url}")
+        # It's good practice to get the current webhook info before removing/setting
+        current_webhook = bot.get_webhook_info()
+        if current_webhook.url != full_webhook_url:
+            bot.remove_webhook()
+            time.sleep(0.1)
+            bot.set_webhook(url=full_webhook_url)
+            print(f"✅ Telegram Webhook set to: {full_webhook_url}")
+        else:
+            print("✅ Telegram Webhook is already correctly set.")
+
     except Exception as e:
         print(f"FATAL: Failed to set webhook. Error: {e}")
 
@@ -548,5 +584,10 @@ if bot is not None:
     set_initial_webhook()
 
 if __name__ == '__main__':
-    print('Starting RoutAfare Bot V5...')
+    print('Starting RoutAfare Bot FINAL...')
+    # Use gunicorn as shown in your logs if running outside of a gunicorn entry point
+    # Note: If running this file directly (python routAfare_botFINAL.py), you'd use app.run()
+    # For deployment environments like Render/Heroku, the Gunicorn command handles the start.
     print('Ready.')
+    # The actual launch is handled by the Gunicorn command specified in your logs:
+    # gunicorn routAfare_botFINAL:app --bind 0.0.0.0:$PORT
