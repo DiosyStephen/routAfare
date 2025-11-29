@@ -8,6 +8,9 @@ Final Integrated Version: Includes all fixes and features:
 - Robust Error Handling for random text input
 - Exit Program option
 - Fix for Bold Text (parse_mode='Markdown' applied consistently)
+- NEW: Age-based Passenger Input
+- NEW: Provider Input for Adult/Teacher/Child Fares
+- NEW: Updated Fare Calculation Logic
 """
 
 import os
@@ -176,12 +179,22 @@ if GCP_LIBRARIES_AVAILABLE and all([GCP_PROJECT_ID, GCP_LOCATION, VERTEX_ENDPOIN
         vertex_predictor = None 
 
 
-def get_fare_prediction_safe(data, predictor):
+# --- UPDATED: Fare Calculation Logic ---
+def get_fare_prediction_safe(data, predictor, fare_type='adult_fare'):
+    """
+    Calculates/Predicts the fare.
+    - If a specific bus is selected (Provider), it returns the pre-set price.
+    - For public/CSV buses, it uses a local fallback (or Vertex AI if active) 
+      to predict a 'standard' fare.
+    - NOTE: The final fare for a booking must be calculated in the confirm_ step.
+    """
+    
+    # Get standard prediction factors for local/AI fallback
     try: 
         distance_km = float(data.get('distance_km', DEFAULT_DISTANCE_KM))
         traffic_level_num = int(data.get('traffic_level_num', 1))
-        pass_count_str = data.get('passengers', '1').replace('+', '')
-        pass_count = int(pass_count_str) 
+        # Passengers are now handled differently, using the full list if available
+        pass_count = len(data.get('passenger_ages', [])) or int(data.get('passengers', '1').replace('+', ''))
     except Exception: 
         distance_km = DEFAULT_DISTANCE_KM
         traffic_level_num = 1
@@ -190,16 +203,53 @@ def get_fare_prediction_safe(data, predictor):
     if predictor:
         try:
             # Vertex AI API call logic would go here
+            # For simplicity, we assume AI returns a single standard adult fare prediction
             pass 
         except Exception as e:
             print(f"Vertex AI Prediction failed: {e}")
 
-    # Local Fallback Calculation
+    # Local Fallback Calculation (A simple standard adult fare prediction)
     base = 20.0 * pass_count 
     per_km = 5.0 
     traffic_mult = 1.0 + (0.1 * traffic_level_num)
     fare = max(5.0, round((base + distance_km * per_km) * traffic_mult, 2))
+    
+    # Return the simple predicted fare for display purposes before booking
     return fare
+
+def calculate_final_fare(bus_data, passenger_ages):
+    """Calculates the final fare based on passenger ages and bus's fare structure."""
+    if not passenger_ages: return 0.0
+    
+    total_fare = 0.0
+    
+    # 1. Private/Provider Bus Fare
+    if bus_data.get('type') == 'PROVIDER':
+        adult_fare = float(bus_data.get('adult_fare', 0.0))
+        teacher_fare = float(bus_data.get('teacher_fare', adult_fare))
+        child_fare = float(bus_data.get('child_fare', adult_fare))
+        
+        for age in passenger_ages:
+            # Simple logic: Age 0-12 is Child, 13+ is Adult/Teacher
+            if age >= 13: 
+                # Assuming 'Adult' is the default category for 13+ unless specified otherwise (simplification)
+                # NOTE: Teacher status would typically be requested as a separate flag, 
+                # but for this script, we'll keep the categories simple based on provider input.
+                total_fare += adult_fare
+            elif age > 0 and age <= 12:
+                total_fare += child_fare
+            else: # Age 0 or non-positive (infant free, etc.)
+                pass 
+        return round(total_fare, 2)
+        
+    # 2. Public/CSV Bus Fare (Use the standard prediction for simplicity, 
+    # as CSV/Public routes don't store detailed age fares)
+    else: 
+        # Fallback to a prediction based on the number of passengers (already calculated)
+        predicted_fare = bus_data.get('fare', 0.0) # This is the total prediction
+        # Since the prediction already accounts for 'passengers', just return it.
+        # This is a simplification, but public transport often has fixed rates.
+        return predicted_fare
 
 
 # --- Bot Initialization ---
@@ -276,8 +326,9 @@ def handle_text(message):
     
     active_steps = [
         'provider_auth', 'prov_enter_route', 'prov_enter_service_name', 
-        'prov_enter_driver', 'prov_enter_seats', 'prov_enter_price', 
-        'prov_enter_contact', 'await_time'
+        'prov_enter_driver', 'prov_enter_seats', 'prov_enter_adult_fare', 
+        'prov_enter_teacher_fare', 'prov_enter_child_fare', 'prov_enter_contact', 
+        'await_age', 'await_time' # NEW: Added await_age
     ]
     
     current_step = sessions.get(chat_id, {}).get('step')
@@ -324,23 +375,48 @@ def handle_text(message):
             seats = int(text)
             if seats <= 0: raise ValueError
             sessions[chat_id]['temp_service']['total_seats'] = seats
-            sessions[chat_id]['step'] = 'prov_enter_price' 
+            sessions[chat_id]['step'] = 'prov_enter_adult_fare' # NEW: Start collecting fares
             save_sessions()
-            # FIX: Ensure parse_mode='Markdown' is set
-            bot.send_message(int(chat_id), "💵 Enter **Fare Price** (e.g., 150.00):", parse_mode='Markdown')
+            # NEW: Prompt for Adult Fare
+            bot.send_message(int(chat_id), "💵 Enter **Adult/Standard Fare Price** (e.g., 150.00):", parse_mode='Markdown')
         except ValueError:
             bot.send_message(int(chat_id), "❌ Invalid number of seats. Please enter a positive whole number.")
 
-    elif current_step == 'prov_enter_price':
+    # NEW: Handle Adult Fare
+    elif current_step == 'prov_enter_adult_fare':
         try:
-            price = float(text)
-            sessions[chat_id]['temp_service']['price'] = text
+            fare = float(text)
+            sessions[chat_id]['temp_service']['adult_fare'] = text
+            sessions[chat_id]['step'] = 'prov_enter_teacher_fare' 
+            save_sessions()
+            # NEW: Prompt for Teacher Fare
+            bot.send_message(int(chat_id), "👨‍🏫 Enter **Teacher Fare Price** (e.g., 100.00). Enter the same as Adult Fare if no discount:", parse_mode='Markdown')
+        except ValueError:
+            bot.send_message(int(chat_id), "❌ Invalid fare format. Please enter a number (e.g., 150.00).")
+
+    # NEW: Handle Teacher Fare
+    elif current_step == 'prov_enter_teacher_fare':
+        try:
+            fare = float(text)
+            sessions[chat_id]['temp_service']['teacher_fare'] = text
+            sessions[chat_id]['step'] = 'prov_enter_child_fare' 
+            save_sessions()
+            # NEW: Prompt for Child Fare
+            bot.send_message(int(chat_id), "👶 Enter **Child Fare Price** (e.g., 75.00). Enter 0 if children travel free:", parse_mode='Markdown')
+        except ValueError:
+            bot.send_message(int(chat_id), "❌ Invalid fare format. Please enter a number (e.g., 100.00).")
+
+    # NEW: Handle Child Fare
+    elif current_step == 'prov_enter_child_fare':
+        try:
+            fare = float(text)
+            sessions[chat_id]['temp_service']['child_fare'] = text
             sessions[chat_id]['step'] = 'prov_enter_contact'
             save_sessions()
-            # FIX: Ensure parse_mode='Markdown' is set
+            # Proceed to contact
             bot.send_message(int(chat_id), "📞 Enter **Contact Number**:", parse_mode='Markdown')
         except ValueError:
-            bot.send_message(int(chat_id), "❌ Invalid price format. Please enter a number (e.g., 150.00).")
+            bot.send_message(int(chat_id), "❌ Invalid fare format. Please enter a number (e.g., 75.00).")
 
 
     elif current_step == 'prov_enter_contact':
@@ -358,6 +434,42 @@ def handle_text(message):
             )
         else:
             bot.send_message(int(chat_id), "❌ Invalid contact format. Please enter a valid number.")
+            
+    # --- PASSENGER AGE INPUT FLOW ---
+    elif current_step == 'await_age':
+        current_data = sessions[chat_id]['data']
+        passengers_to_enter = current_data['passengers_to_enter']
+        current_passenger_num = current_data['current_passenger_num']
+        
+        try:
+            age = int(text)
+            if age < 0 or age > 120: raise ValueError
+            
+            # Store the age
+            current_data['passenger_ages'].append(age)
+            current_data['current_passenger_num'] += 1
+            
+            # Check if all ages are entered
+            if current_data['current_passenger_num'] > passengers_to_enter:
+                # All ages entered, move to time step
+                sessions[chat_id]['step'] = 'await_time'
+                save_sessions()
+                # Prompt for time
+                bot.send_message(int(chat_id), "⏰ Enter your departure time in **HH:MM** (example: 13:45):", parse_mode='Markdown')
+            else:
+                # Continue asking for the next passenger's age
+                sessions[chat_id]['step'] = 'await_age'
+                save_sessions()
+                bot.send_message(
+                    int(chat_id), 
+                    f"🧑 Enter the **age** for Passenger #{current_data['current_passenger_num']}:",
+                    parse_mode='Markdown'
+                )
+            
+        except ValueError:
+            bot.send_message(int(chat_id), "❌ Invalid age. Please enter a whole number between 0 and 120.")
+            return
+
 
     # --- PASSENGER SEARCH FLOW (Time Input) ---
     elif current_step == 'await_time':
@@ -370,11 +482,12 @@ def handle_text(message):
         save_sessions()
 
         try:
-            predicted_fare = get_fare_prediction_safe(sessions[chat_id]['data'], vertex_predictor)
-            sessions[chat_id]['data']['predicted_fare'] = predicted_fare
+            # Predict a simple fare for *display* on CSV/Public routes
+            predicted_fare_placeholder = get_fare_prediction_safe(sessions[chat_id]['data'], vertex_predictor)
+            sessions[chat_id]['data']['predicted_fare'] = predicted_fare_placeholder
             save_sessions()
         except Exception:
-            predicted_fare = get_fare_prediction_safe({}, None)
+            predicted_fare_placeholder = get_fare_prediction_safe({}, None)
         
         bot.send_message(int(chat_id), 'Calculating fare and searching for matching buses... 🔎')
         
@@ -405,21 +518,46 @@ def handle_text(message):
                 'id': temp_bus_id,
                 'type': 'CSV',
                 'name': f"Public Bus ({bus['bus_type_num']})",
-                'details_text': f"Scheduled ({', '.join(bus['times'][:2])}...) | Estimated Fare: Rs. {s_data.get('predicted_fare', 'N/A')}",
-                'fare': s_data.get('predicted_fare', 'N/A')
+                'details_text': f"Scheduled ({', '.join(bus['times'][:2])}...) | Estimated Fare: Rs. {predicted_fare_placeholder}",
+                'fare': predicted_fare_placeholder # Use the simple predicted fare as the placeholder
             }
             final_bus_list.append(bus_details)
 
         # Add Provider buses to the final list
         for svc in provider_matching:
+            
+            # --- CALCULATE FARE FOR PROVIDER BUS USING AGE DATA ---
+            # NOTE: We use the `price` field as the `adult_fare` if the new fields are missing for backward compatibility
+            fare_structure = {
+                'adult_fare': float(svc.get('adult_fare', svc.get('price', 0.0))),
+                'teacher_fare': float(svc.get('teacher_fare', svc.get('adult_fare', svc.get('price', 0.0)))),
+                'child_fare': float(svc.get('child_fare', 0.0))
+            }
+            
+            # Create a mock bus data structure for the final fare calculation function
+            mock_bus_data = {
+                'type': 'PROVIDER', 
+                'adult_fare': fare_structure['adult_fare'],
+                'teacher_fare': fare_structure['teacher_fare'],
+                'child_fare': fare_structure['child_fare']
+            }
+            
+            final_calculated_fare = calculate_final_fare(mock_bus_data, s_data.get('passenger_ages', []))
+            
+            # Store full fare details in the bus list object
+            svc_id = svc['id']
+            sessions[chat_id]['fare_breakdown'] = sessions[chat_id].get('fare_breakdown', {})
+            sessions[chat_id]['fare_breakdown'][svc_id] = final_calculated_fare
+            save_sessions() 
+
             pay_str = ", ".join([p.capitalize() for p in svc.get('payment_methods', [])])
             seats_info = f"Seats: {svc.get('remaining_seats', 'N/A')}" 
             bus_details = {
-                'id': svc['id'], 
+                'id': svc_id, 
                 'type': 'PROVIDER',
                 'name': f"{svc.get('service_name', 'N/A')} | Driver: {svc.get('driver')}",
-                'details_text': f"Fare: Rs. {svc.get('price')} | Contact: {svc.get('contact')} | Payment: {pay_str} | {seats_info}",
-                'fare': svc.get('price')
+                'details_text': f"Calculated Fare: Rs. {final_calculated_fare} | Contact: {svc.get('contact')} | Payment: {pay_str} | {seats_info}",
+                'fare': final_calculated_fare
             }
             final_bus_list.append(bus_details)
 
@@ -435,7 +573,8 @@ def handle_text(message):
         for bus in final_bus_list:
             keyboard.add(InlineKeyboardButton(f"✅ Book: {bus['name']} - {bus['details_text']}", callback_data=f"confirm_{bus['id']}"))
 
-        fare_text = f"🚌 *Your Search Summary*\nRoute: {route_name}\nTime: {time_input}\nEstimated Fare: Rs\. {s_data.get('predicted_fare', 'N/A')}\n\n**Select a bus to Confirm Booking:**"
+        # NOTE: Estimated Fare is now only the placeholder for public buses. Providers show the calculated fare.
+        fare_text = f"🚌 *Your Search Summary*\nRoute: {route_name}\nTime: {time_input}\nPassengers: {len(s_data.get('passenger_ages', []))}\n\n**Select a bus to Confirm Booking:**"
         
         bot.send_message(int(chat_id), fare_text, parse_mode='Markdown', reply_markup=keyboard)
         sessions[chat_id]['step'] = 'await_bus_select'
@@ -509,13 +648,24 @@ def handle_query(call):
         edit_and_answer(f"Selected: **{route}**\n\n👥 **How many passengers?**", passenger_count_keyboard())
 
     elif data.startswith("pass_count_"):
-        count = data.replace("pass_count_", "")
-        sessions[chat_id]['data']['passengers'] = count
-        sessions[chat_id]['step'] = 'await_time'
-        sessions[chat_id]['data']['distance_km'] = DEFAULT_DISTANCE_KM
-        sessions[chat_id]['data']['traffic_level_num'] = 1 
+        count_str = data.replace("pass_count_", "").replace('+', '')
+        try:
+            count = int(count_str)
+        except ValueError:
+            count = 1 # Default to 1 if it was 7+ or invalid
+
+        sessions[chat_id]['data']['passengers'] = count_str
+        sessions[chat_id]['data']['passengers_to_enter'] = count
+        sessions[chat_id]['data']['current_passenger_num'] = 1
+        sessions[chat_id]['data']['passenger_ages'] = [] # NEW: Initialize age list
+        sessions[chat_id]['step'] = 'await_age' # NEW: Transition to age input
         save_sessions()
-        edit_and_answer("⏰ Enter your departure time in **HH:MM** (example: 13:45):")
+        
+        # NEW: Start asking for the first passenger's age
+        edit_and_answer(
+            f"👥 **Passenger Ages**\n\nEnter the **age** for Passenger #1:",
+            None
+        )
 
     elif data.startswith("confirm_"):
         # --- BOOKING CONFIRMATION STEP (Updated for Seat Management and Persistence) ---
@@ -528,13 +678,10 @@ def handle_query(call):
             clear_session(chat_id)
             return
 
-        pass_count_str = sessions[chat_id]['data'].get('passengers', '1')
-        try:
-            pass_count = int(pass_count_str.replace('+', ''))
-        except ValueError:
-            pass_count = 1
-
+        pass_count = sessions[chat_id]['data'].get('passengers_to_enter', 1)
+        
         seats_remaining_msg = ""
+        final_fare_to_display = selected_bus['fare'] # Use the final fare calculated in await_time
         
         if selected_bus['type'] == 'PROVIDER':
             # Find the actual service object in the services_db list
@@ -555,9 +702,10 @@ def handle_query(call):
                     seats_remaining_msg = f"💺 **Seats Remaining:** {new_seats}"
                     break
         
-        fare_display = f"Rs. {selected_bus['fare']}" if selected_bus['fare'] != 'N/A' else "Estimated (Check operator)"
+        fare_display = f"Rs. {final_fare_to_display}" if final_fare_to_display != 'N/A' else "Estimated (Check operator)"
         contact = "N/A"
         if selected_bus['type'] == 'PROVIDER':
+            # Extract contact from details_text (since it holds the full details)
             contact_match = re.search(r'Contact: (.*?) \| Payment:', selected_bus['details_text'])
             if contact_match:
                 contact = contact_match.group(1).strip()
@@ -565,7 +713,7 @@ def handle_query(call):
         confirmation_message = (
             f"✅ **BOOKING CONFIRMED for {pass_count} passenger(s)!** 🎉\n\n"
             f"🚍 **Service:** {selected_bus['name']}\n"
-            f"💲 **Fare:** {fare_display}\n"
+            f"💲 **Total Fare:** {fare_display}\n" # Updated to Total Fare
             f"📞 **Contact:** {contact}\n"
             f"{seats_remaining_msg}\n\n"
             f"Thank you for using RoutAfare. Please be ready to board at the departure time."
@@ -601,7 +749,12 @@ def handle_query(call):
         new_service = sessions[chat_id]['temp_service']
         new_service['id'] = str(int(time.time()))
         new_service['status'] = 'active'
-        new_service['remaining_seats'] = new_service['total_seats'] 
+        new_service['remaining_seats'] = int(new_service['total_seats']) # Ensure it's an int
+        
+        # Set default/convert prices
+        new_service['adult_fare'] = new_service.get('adult_fare', new_service.get('price', '0.0'))
+        # Remove old 'price' key to avoid confusion
+        if 'price' in new_service: del new_service['price']
         
         services_db['services'].append(new_service)
         save_services() # <-- PERSISTENCE FIX: Save the new service to the file
