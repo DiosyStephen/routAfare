@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
 routAfare_botFINAL.py
-Final Integrated Version: Includes Role-based Menus, Combined Data Search, 
-Bus Service Name Input, Final Booking Confirmation, fix for RecursionError 
-in Provider Status Toggle, AND SECURE VERTEX AI INITIALIZATION.
+Final Integrated Version: Includes all fixes and features:
+- Secure Vertex AI Initialization
+- Data Persistence Fix (Provider services)
+- Seat Management (Total/Remaining)
+- Robust Error Handling for random text input
+- Exit Program option
+- Fix for Bold Text (parse_mode='Markdown' applied consistently)
 """
 
 import os
@@ -25,7 +29,6 @@ try:
     try:
         from google.cloud import aiplatform
         from google.oauth2 import service_account
-        # Check if necessary libraries are available
         GCP_LIBRARIES_AVAILABLE = True
     except ImportError:
         aiplatform = None
@@ -56,6 +59,7 @@ DEFAULT_DISTANCE_KM = 5.0
 
 # --- Data Persistence Helpers ---
 def safe_write_json(file_path, data):
+    """Safely writes Python object to a JSON file."""
     try:
         os.makedirs(os.path.dirname(file_path) or '.', exist_ok=True)
         with open(file_path, 'w', encoding='utf8') as f:
@@ -64,28 +68,31 @@ def safe_write_json(file_path, data):
         print(f"Error writing {file_path}: {e}")
 
 def safe_read_json(file_path, fallback):
+    """Safely reads JSON file, returning fallback on error or if file is missing/empty."""
     if not os.path.exists(file_path):
         return fallback
     try:
         with open(file_path, 'r', encoding='utf8') as f:
             content = f.read().strip()
-            return json.loads(content or "{}")
+            # If the file is empty, return the fallback
+            return json.loads(content) if content else fallback
     except Exception:
+        # If any error occurs (e.g., malformed JSON), return the fallback
         return fallback
 
 # Load data stores
 sessions = safe_read_json(SESSIONS_FILE, {})
-services_db = safe_read_json(SERVICES_FILE, {"services": []}) # Dynamic provider data
+# FIX: Ensure services_db always loads existing data if SERVICES_FILE exists
+services_db = safe_read_json(SERVICES_FILE, {"services": []}) 
 
 def save_sessions(): safe_write_json(SESSIONS_FILE, sessions)
-def save_services(): safe_write_json(SERVICES_FILE, services_db)
+def save_services(): safe_write_json(SERVICES_FILE, services_db) 
 def clear_session(chat_id):
     if str(chat_id) in sessions:
         del sessions[str(chat_id)]
         save_sessions()
 
 # --- CSV & Data Loading ---
-
 def time_to_minutes(t: str):
     m = re.match(r'^(\d{1,2}):(\d{2})$', t)
     if not m: return None
@@ -140,7 +147,7 @@ def get_all_routes():
         csv_routes = {b.get('name') for b in buses if b.get('name')}
     except Exception: pass
     
-    json_routes = {s['route'] for s in services_db['services']}
+    json_routes = {s['route'] for s in services_db.get('services', [])}
     
     return sorted(list(csv_routes.union(json_routes)))
 
@@ -158,47 +165,38 @@ vertex_predictor = None
 
 if GCP_LIBRARIES_AVAILABLE and all([GCP_PROJECT_ID, GCP_LOCATION, VERTEX_ENDPOINT_ID, CREDENTIALS_JSON]):
     try:
-        # Load credentials from the secure JSON string environment variable
         credentials_info = json.loads(CREDENTIALS_JSON)
         credentials = service_account.Credentials.from_service_account_info(credentials_info)
-        
-        # Initialize the Vertex AI client and endpoint
         aiplatform.init(project=GCP_PROJECT_ID, location=GCP_LOCATION, credentials=credentials)
-        
-        # This object is what we call to get predictions
         vertex_predictor = aiplatform.Endpoint(endpoint_name=VERTEX_ENDPOINT_ID) 
-        
         print("✅ Vertex AI Prediction Endpoint Initialized.")
 
     except Exception as e:
         print(f"❌ Error initializing Vertex AI. Falling back to local calculation. Error: {e}")
-        vertex_predictor = None # Ensure predictor is None on failure
+        vertex_predictor = None 
 
 
 def get_fare_prediction_safe(data, predictor):
-    # This is a fallback calculation if Vertex AI fails or is not configured
     try: 
         distance_km = float(data.get('distance_km', DEFAULT_DISTANCE_KM))
         traffic_level_num = int(data.get('traffic_level_num', 1))
+        pass_count_str = data.get('passengers', '1').replace('+', '')
+        pass_count = int(pass_count_str) 
     except Exception: 
         distance_km = DEFAULT_DISTANCE_KM
         traffic_level_num = 1
+        pass_count = 1
         
     if predictor:
         try:
-            # Example structure for calling Vertex AI (needs exact input schema)
-            # input_instance = [{"distance_km": distance_km, "traffic_level": traffic_level_num, "hour": int(data['time'].split(':')[0])}]
-            # prediction = predictor.predict(instances=input_instance)
-            # return prediction.predictions[0] 
-            
-            # For now, return a placeholder based on fallback for simplicity until schema is known
-            print("NOTE: Using fallback calculation even with predictor initialized.")
+            # Vertex AI API call logic would go here
             pass 
         except Exception as e:
             print(f"Vertex AI Prediction failed: {e}")
 
-    base = 20.0
-    per_km = 5.0
+    # Local Fallback Calculation
+    base = 20.0 * pass_count 
+    per_km = 5.0 
     traffic_mult = 1.0 + (0.1 * traffic_level_num)
     fare = max(5.0, round((base + distance_km * per_km) * traffic_mult, 2))
     return fare
@@ -214,6 +212,9 @@ def main_menu_keyboard():
     markup.add(
         InlineKeyboardButton("👤 Passenger", callback_data="role_passenger"),
         InlineKeyboardButton("🚌 Bus Provider", callback_data="role_provider")
+    )
+    markup.add(
+        InlineKeyboardButton("❌ Exit Program", callback_data="program_exit")
     )
     return markup
 
@@ -246,6 +247,15 @@ def payment_toggle_keyboard(current_selection):
     markup.add(InlineKeyboardButton("💾 Save & Finish", callback_data="prov_save_service"))
     return markup
 
+def send_error_message(chat_id):
+    """Sends a standardized error/help message."""
+    bot.send_message(
+        chat_id, 
+        "🚫 **Invalid Input!**\n\nI was expecting data for a specific step, or the `/start` command.\n\n"
+        "Please use the menu below or type `/start` to begin a new process.",
+        reply_markup=main_menu_keyboard(),
+        parse_mode='Markdown'
+    )
 
 # --- MESSAGE HANDLERS (Text Input) ---
 
@@ -264,57 +274,82 @@ def handle_text(message):
     chat_id = str(message.chat.id)
     text = message.text.strip()
     
-    if chat_id not in sessions:
-        send_welcome(message)
+    active_steps = [
+        'provider_auth', 'prov_enter_route', 'prov_enter_service_name', 
+        'prov_enter_driver', 'prov_enter_seats', 'prov_enter_price', 
+        'prov_enter_contact', 'await_time'
+    ]
+    
+    current_step = sessions.get(chat_id, {}).get('step')
+
+    # FIX: Robust Error Handling for random text
+    if current_step not in active_steps:
+        send_error_message(int(chat_id))
         return
 
-    step = sessions[chat_id].get('step')
-
     # --- PROVIDER AUTH ---
-    if step == 'provider_auth':
+    if current_step == 'provider_auth':
         if text == PROVIDER_PASSWORD:
             sessions[chat_id]['step'] = 'provider_menu'
             save_sessions()
+            # FIX: Ensure parse_mode='Markdown' is set
             bot.send_message(int(chat_id), "🔓 **Access Granted**\nManage your fleet:", reply_markup=provider_menu_keyboard(), parse_mode='Markdown')
         else:
             bot.send_message(int(chat_id), "❌ Wrong Password. Try again or /start")
 
     # --- PROVIDER ADDING DATA FLOW ---
-    elif step == 'prov_enter_route':
+    elif current_step == 'prov_enter_route':
         sessions[chat_id]['temp_service']['route'] = text
         sessions[chat_id]['step'] = 'prov_enter_service_name' 
         save_sessions()
-        bot.send_message(int(chat_id), "🚍 Enter the **Bus Service/Company Name** (e.g., ABC Express, Private Bus):")
+        # FIX: Ensure parse_mode='Markdown' is set
+        bot.send_message(int(chat_id), "🚍 Enter the **Bus Service/Company Name** (e.g., ABC Express, Private Bus):", parse_mode='Markdown')
 
-    elif step == 'prov_enter_service_name':
+    elif current_step == 'prov_enter_service_name':
         sessions[chat_id]['temp_service']['service_name'] = text
         sessions[chat_id]['step'] = 'prov_enter_driver'
         save_sessions()
-        bot.send_message(int(chat_id), "🧑 Enter **Driver Name**:")
+        # FIX: Ensure parse_mode='Markdown' is set
+        bot.send_message(int(chat_id), "🧑 Enter **Driver Name**:", parse_mode='Markdown')
 
-    elif step == 'prov_enter_driver':
+    elif current_step == 'prov_enter_driver':
         sessions[chat_id]['temp_service']['driver'] = text
-        sessions[chat_id]['step'] = 'prov_enter_price'
+        sessions[chat_id]['step'] = 'prov_enter_seats' 
         save_sessions()
-        bot.send_message(int(chat_id), "💵 Enter **Fare Price** (e.g., 150.00):")
+        # FIX: Ensure parse_mode='Markdown' is set
+        bot.send_message(int(chat_id), "💺 Enter the **Total Number of Seats** available:", parse_mode='Markdown')
 
-    elif step == 'prov_enter_price':
+    elif current_step == 'prov_enter_seats':
+        try:
+            seats = int(text)
+            if seats <= 0: raise ValueError
+            sessions[chat_id]['temp_service']['total_seats'] = seats
+            sessions[chat_id]['step'] = 'prov_enter_price' 
+            save_sessions()
+            # FIX: Ensure parse_mode='Markdown' is set
+            bot.send_message(int(chat_id), "💵 Enter **Fare Price** (e.g., 150.00):", parse_mode='Markdown')
+        except ValueError:
+            bot.send_message(int(chat_id), "❌ Invalid number of seats. Please enter a positive whole number.")
+
+    elif current_step == 'prov_enter_price':
         try:
             price = float(text)
             sessions[chat_id]['temp_service']['price'] = text
             sessions[chat_id]['step'] = 'prov_enter_contact'
             save_sessions()
-            bot.send_message(int(chat_id), "📞 Enter **Contact Number**:")
+            # FIX: Ensure parse_mode='Markdown' is set
+            bot.send_message(int(chat_id), "📞 Enter **Contact Number**:", parse_mode='Markdown')
         except ValueError:
             bot.send_message(int(chat_id), "❌ Invalid price format. Please enter a number (e.g., 150.00).")
 
 
-    elif step == 'prov_enter_contact':
+    elif current_step == 'prov_enter_contact':
         if re.match(r'^\+?[\d\s-]{5,}$', text):
             sessions[chat_id]['temp_service']['contact'] = text
             sessions[chat_id]['step'] = 'prov_select_payment'
             sessions[chat_id]['temp_service']['payment_methods'] = [] 
             save_sessions()
+            # FIX: Ensure parse_mode='Markdown' is set
             bot.send_message(
                 int(chat_id), 
                 "💳 **Payment Options**\nToggle allowed methods:",
@@ -325,7 +360,7 @@ def handle_text(message):
             bot.send_message(int(chat_id), "❌ Invalid contact format. Please enter a valid number.")
 
     # --- PASSENGER SEARCH FLOW (Time Input) ---
-    elif step == 'await_time':
+    elif current_step == 'await_time':
         m = re.match(r'^([0-1]?\d|2[0-3]):([0-5]\d)$', text)
         if not m:
             bot.send_message(int(chat_id), "❌ Invalid time format. Use HH:MM (e.g., 13:45).")
@@ -335,12 +370,11 @@ def handle_text(message):
         save_sessions()
 
         try:
-            # Use the integrated fare prediction function
             predicted_fare = get_fare_prediction_safe(sessions[chat_id]['data'], vertex_predictor)
             sessions[chat_id]['data']['predicted_fare'] = predicted_fare
             save_sessions()
         except Exception:
-            predicted_fare = get_fare_prediction_safe({}, None) # Fallback hard
+            predicted_fare = get_fare_prediction_safe({}, None)
         
         bot.send_message(int(chat_id), 'Calculating fare and searching for matching buses... 🔎')
         
@@ -357,14 +391,14 @@ def handle_text(message):
         
         # 2. Search dynamic Provider data
         provider_matching = [
-            svc for svc in services_db['services'] 
+            svc for svc in services_db.get('services', [])
             if svc.get('route') == route_name 
             and svc.get('status') != 'unavailable'
         ]
         
         final_bus_list = []
 
-        # Add CSV buses to the final list, store full details in session for later
+        # Add CSV buses to the final list
         for bus in csv_matching:
             temp_bus_id = f"CSV-{bus['id']}" 
             bus_details = {
@@ -379,11 +413,12 @@ def handle_text(message):
         # Add Provider buses to the final list
         for svc in provider_matching:
             pay_str = ", ".join([p.capitalize() for p in svc.get('payment_methods', [])])
+            seats_info = f"Seats: {svc.get('remaining_seats', 'N/A')}" 
             bus_details = {
                 'id': svc['id'], 
                 'type': 'PROVIDER',
                 'name': f"{svc.get('service_name', 'N/A')} | Driver: {svc.get('driver')}",
-                'details_text': f"Fare: Rs. {svc.get('price')} | Contact: {svc.get('contact')} | Payment: {pay_str}",
+                'details_text': f"Fare: Rs. {svc.get('price')} | Contact: {svc.get('contact')} | Payment: {pay_str} | {seats_info}",
                 'fare': svc.get('price')
             }
             final_bus_list.append(bus_details)
@@ -393,13 +428,11 @@ def handle_text(message):
             clear_session(chat_id)
             return
 
-        # Store the list of found buses in the session for confirmation step
         sessions[chat_id]['found_buses'] = {b['id']: b for b in final_bus_list}
         save_sessions()
 
         keyboard = InlineKeyboardMarkup()
         for bus in final_bus_list:
-            # Use a CONFIRM callback for the next step
             keyboard.add(InlineKeyboardButton(f"✅ Book: {bus['name']} - {bus['details_text']}", callback_data=f"confirm_{bus['id']}"))
 
         fare_text = f"🚌 *Your Search Summary*\nRoute: {route_name}\nTime: {time_input}\nEstimated Fare: Rs\. {s_data.get('predicted_fare', 'N/A')}\n\n**Select a bus to Confirm Booking:**"
@@ -409,8 +442,6 @@ def handle_text(message):
         save_sessions()
         return
 
-    # Unrecognized text input is simply ignored.
-
 # --- CALLBACK QUERY HANDLER (The Core UI Logic) ---
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -419,6 +450,7 @@ def handle_query(call):
     data = call.data
     
     def edit_and_answer(text, reply_markup=None):
+        # Ensure edit_and_answer always sets parse_mode
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, 
                               reply_markup=reply_markup, parse_mode='Markdown')
         bot.answer_callback_query(call.id)
@@ -426,7 +458,22 @@ def handle_query(call):
     # --- 1. MAIN MENU/ROLES ---
     if data == "menu_main":
         clear_session(chat_id)
-        edit_and_answer("👋 **Welcome to RoutAfare!**\n\nPlease select your role:", main_menu_keyboard())
+        edit_and_answer("👋 **Welcome to routAfare!**\n\nPlease select your role:", main_menu_keyboard())
+
+    # --- EXIT OPTION ---
+    elif data == "program_exit":
+        clear_session(chat_id)
+        bot.send_message(
+            int(chat_id), 
+            "👋 **Goodbye!**\n\nYour session has been cleared. Type `/start` to begin a new journey.",
+            parse_mode='Markdown'
+        )
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id, "Exiting program.")
+        return
 
     elif data == "role_passenger":
         routes = get_all_routes()
@@ -448,7 +495,8 @@ def handle_query(call):
         sessions[chat_id] = {'step': 'provider_auth'}
         save_sessions()
         bot.delete_message(call.message.chat.id, call.message.message_id)
-        bot.send_message(int(chat_id), "🔒 Enter Provider Password:")
+        # FIX: Ensure parse_mode='Markdown' is explicitly set here
+        bot.send_message(int(chat_id), "🔒 Enter **Provider Password**:", parse_mode='Markdown')
         bot.answer_callback_query(call.id)
         return
 
@@ -465,12 +513,12 @@ def handle_query(call):
         sessions[chat_id]['data']['passengers'] = count
         sessions[chat_id]['step'] = 'await_time'
         sessions[chat_id]['data']['distance_km'] = DEFAULT_DISTANCE_KM
-        sessions[chat_id]['data']['traffic_level_num'] = 1 # Placeholder for model
+        sessions[chat_id]['data']['traffic_level_num'] = 1 
         save_sessions()
         edit_and_answer("⏰ Enter your departure time in **HH:MM** (example: 13:45):")
 
     elif data.startswith("confirm_"):
-        # --- BOOKING CONFIRMATION STEP ---
+        # --- BOOKING CONFIRMATION STEP (Updated for Seat Management and Persistence) ---
         bus_id = data.replace('confirm_', '', 1)
         found_buses = sessions[chat_id].get('found_buses', {})
         selected_bus = found_buses.get(bus_id)
@@ -480,21 +528,46 @@ def handle_query(call):
             clear_session(chat_id)
             return
 
-        fare_display = f"Rs. {selected_bus['fare']}" if selected_bus['fare'] != 'N/A' else "Estimated (Check operator)"
+        pass_count_str = sessions[chat_id]['data'].get('passengers', '1')
+        try:
+            pass_count = int(pass_count_str.replace('+', ''))
+        except ValueError:
+            pass_count = 1
+
+        seats_remaining_msg = ""
         
-        # Extract Contact from details_text if available
+        if selected_bus['type'] == 'PROVIDER':
+            # Find the actual service object in the services_db list
+            for svc in services_db['services']:
+                if svc['id'] == selected_bus['id']:
+                    
+                    current_seats = svc.get('remaining_seats', svc.get('total_seats', 50))
+                    
+                    if current_seats < pass_count:
+                        bot.answer_callback_query(call.id, "❌ Not enough seats remaining on this service.", show_alert=True)
+                        return 
+                        
+                    # Update seat count and save the persistence file
+                    new_seats = current_seats - pass_count
+                    svc['remaining_seats'] = new_seats
+                    save_services() # <-- PERSISTENCE FIX: Save the updated service list
+                    
+                    seats_remaining_msg = f"💺 **Seats Remaining:** {new_seats}"
+                    break
+        
+        fare_display = f"Rs. {selected_bus['fare']}" if selected_bus['fare'] != 'N/A' else "Estimated (Check operator)"
         contact = "N/A"
         if selected_bus['type'] == 'PROVIDER':
-             # Looks for 'Contact: XXXX | Payment:'
             contact_match = re.search(r'Contact: (.*?) \| Payment:', selected_bus['details_text'])
             if contact_match:
                 contact = contact_match.group(1).strip()
         
         confirmation_message = (
-            f"✅ **BOOKING CONFIRMED!** 🎉\n\n"
+            f"✅ **BOOKING CONFIRMED for {pass_count} passenger(s)!** 🎉\n\n"
             f"🚍 **Service:** {selected_bus['name']}\n"
             f"💲 **Fare:** {fare_display}\n"
-            f"📞 **Contact:** {contact}\n\n"
+            f"📞 **Contact:** {contact}\n"
+            f"{seats_remaining_msg}\n\n"
             f"Thank you for using RoutAfare. Please be ready to board at the departure time."
         )
 
@@ -528,9 +601,10 @@ def handle_query(call):
         new_service = sessions[chat_id]['temp_service']
         new_service['id'] = str(int(time.time()))
         new_service['status'] = 'active'
+        new_service['remaining_seats'] = new_service['total_seats'] 
         
         services_db['services'].append(new_service)
-        save_services()
+        save_services() # <-- PERSISTENCE FIX: Save the new service to the file
         
         edit_and_answer("✅ **Service Saved Successfully!**", provider_menu_keyboard())
         clear_session(chat_id)
@@ -552,7 +626,6 @@ def handle_query(call):
     elif data.startswith("toggle_stat_"):
         s_id = data.split("_")[2]
         
-        # 1. Update the status and save
         for svc in services_db['services']:
             if svc['id'] == s_id:
                 curr = svc.get('status', 'active')
@@ -560,7 +633,6 @@ def handle_query(call):
                 save_services()
                 break
         
-        # 2. Re-create and update the message with the new status list (Fixes RecursionError)
         if not services_db['services']:
             bot.answer_callback_query(call.id, "No services remaining.")
             edit_and_answer("Manage your fleet:", provider_menu_keyboard())
@@ -593,7 +665,6 @@ def webhook():
     if request.headers.get('content-type') == 'application/json':
         json_string = request.get_data().decode('utf-8')
         update = telebot.types.Update.de_json(json_string)
-        # Check for bot object before processing
         if bot:
             bot.process_new_updates([update])
         return '', 200
@@ -625,4 +696,4 @@ if bot is not None:
 
 if __name__ == '__main__':
     print('Starting RoutAfare Bot FINAL...')
-    print('Ready.')
+    print('Ready.IT FINALLY WORKS!! [easter egg left by Azan]')
