@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 routAfare_bot_render_pg.py
@@ -94,6 +95,7 @@ def create_tables():
                 driver TEXT,
                 total_seats INTEGER,
                 remaining_seats INTEGER,
+                bus_type TEXT, -- ADDED: Bus type field
                 adult_fare NUMERIC,
                 teacher_fare NUMERIC,
                 child_fare NUMERIC,
@@ -192,12 +194,13 @@ async def save_new_service_async(service_data):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO services (id, route, service_name, driver, total_seats, remaining_seats, adult_fare, teacher_fare, child_fare, contact, payment_methods, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                INSERT INTO services (id, route, service_name, driver, total_seats, remaining_seats, bus_type, adult_fare, teacher_fare, child_fare, contact, payment_methods, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
                 """,
                 (
                     service_data['id'], service_data['route'], service_data['service_name'], service_data['driver'], 
-                    service_data['total_seats'], service_data['remaining_seats'], service_data['adult_fare'], 
+                    service_data['total_seats'], service_data['remaining_seats'], service_data['bus_type'], # Updated to include bus_type
+                    service_data['adult_fare'], 
                     service_data['teacher_fare'], service_data['child_fare'], service_data['contact'], 
                     Json(service_data['payment_methods']), service_data['status']
                 )
@@ -487,7 +490,7 @@ def handle_text(message):
     # List of steps where text input is expected
     active_steps = [
         'provider_auth', 'prov_enter_route', 'prov_enter_service_name', 
-        'prov_enter_driver', 'prov_enter_seats', 'prov_enter_adult_fare', 
+        'prov_enter_driver', 'prov_enter_bus_type', 'prov_enter_seats', 'prov_enter_adult_fare', # ADDED: prov_enter_bus_type
         'prov_enter_teacher_fare', 'prov_enter_child_fare', 'prov_enter_contact', 
         'await_age', 'await_time'
     ]
@@ -524,6 +527,12 @@ def handle_text(message):
 
     elif current_step == 'prov_enter_driver':
         session_data['temp_service']['driver'] = text
+        session_data['step'] = 'prov_enter_bus_type' # NEW STEP: Bus Type
+        sync_save_session(chat_id, session_data)
+        bot.send_message(int(chat_id), "🚌 Enter the **Bus Type** (e.g., Luxury, Semi-Luxury, Normal):", parse_mode='Markdown')
+
+    elif current_step == 'prov_enter_bus_type': # NEW HANDLER: Store Bus Type
+        session_data['temp_service']['bus_type'] = text
         session_data['step'] = 'prov_enter_seats' 
         sync_save_session(chat_id, session_data)
         bot.send_message(int(chat_id), "💺 Enter the **Total Number of Seats** available (e.g., 50):", parse_mode='Markdown')
@@ -696,11 +705,13 @@ def handle_text(message):
             # Seat Management: Display remaining seats
             seats_info = f"Seats: {svc.get('remaining_seats', 'N/A')}" 
             
+            bus_type = svc.get('bus_type', 'N/A')
+            
             bus_details = {
                 'id': svc['id'], 
                 'type': 'PROVIDER',
-                'name': f"{svc.get('service_name', 'N/A')} | Driver: {svc.get('driver')}",
-                'details_text': f"Calculated Total Fare: Rs. {final_calculated_fare} | Contact: {svc.get('contact')} | Payment: {pay_str} | {seats_info}",
+                'name': f"{svc.get('service_name', 'N/A')} ({bus_type}) | Driver: {svc.get('driver')}", # Included Bus Type
+                'details_text': f"Total Fare: Rs. {final_calculated_fare} | Contact: {svc.get('contact')} | Payment: {pay_str} | {seats_info}", # Explicitly display 'Total Fare'
                 'fare': final_calculated_fare
             }
             final_bus_list.append(bus_details)
@@ -854,17 +865,20 @@ def handle_query(call):
                 # Update Postgres document with new remaining seats
                 sync_update_service(svc['id'], {'remaining_seats': new_seats})
                 
-                seats_remaining_msg = f"💺 **Seats Remaining:** {new_seats}"
+                seats_remaining_msg = f"💺 **Final Seats Remaining:** {new_seats}" # Display final remaining seats
             else:
                  bot.answer_callback_query(call.id, "❌ Service not found in database.", show_alert=True)
                  return
+        elif selected_bus['type'] == 'CSV':
+            seats_remaining_msg = "💺 **Seat availability for Public Bus is estimated.**"
+
 
         fare_display = f"Rs. {final_fare_to_display}" if final_fare_to_display != 'N/A' else "Estimated (Check operator)"
 
         confirmation_message = (
             f"✅ **BOOKING CONFIRMED for {pass_count} passenger(s)!** 🎉\n\n"
             f"🚍 **Service:** {selected_bus['name']}\n"
-            f"💲 **Total Fare:** {fare_display}\n" 
+            f"💲 **Total Predicted Bus Fare:** {fare_display}\n" # Explicitly display total predicted fare
             f"📞 **Contact:** {contact}\n"
             f"{seats_remaining_msg}\n\n"
             f"Thank you for using RoutAfare. Please be ready to board at the departure time."
@@ -910,6 +924,10 @@ def handle_query(call):
         new_service['teacher_fare'] = float(new_service.get('teacher_fare', new_service['adult_fare']))
         new_service['child_fare'] = float(new_service.get('child_fare', 0.0))
         
+        # Ensure bus_type exists
+        if 'bus_type' not in new_service:
+             new_service['bus_type'] = 'Standard'
+
         sync_save_new_service(new_service) # Save the new service to Postgres
         
         edit_and_answer(call, "✅ **Service Saved Successfully!**", provider_menu_keyboard())
