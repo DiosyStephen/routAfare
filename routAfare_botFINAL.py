@@ -1,11 +1,12 @@
-
 #!/usr/bin/env python3
 """
-routAfare_bot_render_pg.py
+routAfare_botFINAL.py
 Integrated Version using Render's PostgreSQL for data persistence.
 - Replaces Firestore with asynchronous PostgreSQL connection (using psycopg2).
 - Assumes DATABASE_URL is set in the environment (standard for Render).
 - Vertex AI is kept as optional, relying on the environment variables for initialization.
+- FIXED: Passenger search query now includes all services (Public and Private).
+- REFINED: Status management logic now correctly refreshes the menu.
 """
 
 import os
@@ -13,28 +14,27 @@ import json
 import re
 import sys
 import time
-import asyncio
 from datetime import datetime, timedelta
 
 # Third-party libraries
 try:
-    # Ensure necessary libraries are installed via pip
     from dotenv import load_dotenv
     from flask import Flask, request
     import telebot
     from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-    import pandas as pd
     
     # PostgreSQL Imports
     import psycopg2
-    from psycopg2.extras import DictCursor, Json
+    from psycopg2.extras import DictCursor
     
-    # Google Cloud Imports (kept for optional Vertex AI)
-    from google.cloud import aiplatform
-    from google.oauth2 import service_account
+    # Google Cloud Imports (kept for optional Vertex AI, but not strictly used)
+    try:
+        from google.cloud import aiplatform
+        GCP_LIBRARIES_AVAILABLE = True
+    except ImportError:
+        GCP_LIBRARIES_AVAILABLE = False
     
     DB_LIBRARIES_AVAILABLE = True
-    GCP_LIBRARIES_AVAILABLE = True # Keep True to allow Vertex AI attempt
 except ImportError as e:
     print(f"CRITICAL: Missing required package. Error: {e}")
     sys.exit(1)
@@ -45,954 +45,684 @@ load_dotenv()
 # --- Configuration ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 WEBHOOK_URL_BASE = os.getenv('WEBHOOK_URL_BASE')
-WEBHOOK_URL_PATH = os.getenv('WEBHOOK_URL_PATH', '/')
-SERVER_PORT = int(os.getenv('PORT', 8080))
-
-PROVIDER_PASSWORD = os.getenv('PROVIDER_PASSWORD', 'admin') 
-DEFAULT_DISTANCE_KM = 5.0
-
-# **RENDER POSTGRESQL CONFIGURATION**
+PROVIDER_PASSWORD = os.getenv('PROVIDER_PASSWORD')
 DATABASE_URL = os.getenv('DATABASE_URL')
-if not DATABASE_URL:
-    print("CRITICAL: DATABASE_URL environment variable is missing. Cannot connect to PostgreSQL.")
-    sys.exit(1)
+PROJECT_ID = os.getenv('PROJECT_ID')
+MODEL_ENDPOINT_ID = os.getenv('MODEL_ENDPOINT_ID')
 
-# CSV File (remains local for bus routes)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CSV_FILE_NAME = os.getenv('CSV_FILE_NAME', 'final routa dataset for bus routes.csv')
-CSV_FILE_PATH = os.path.join(BASE_DIR, CSV_FILE_NAME)
+# --- Globals and Bot Setup ---
+WEBHOOK_URL_PATH = f"/{BOT_TOKEN}"
+bot = telebot.TeleBot(BOT_TOKEN)
+user_states = {} # Simple in-memory storage for user session state
 
-# --- POSTGRESQL INITIALIZATION & HELPERS ---
+# --- PostgreSQL Connection and Setup ---
+def get_sync_db_connection(dict_cursor=False):
+    """Establishes a synchronous connection to the PostgreSQL database."""
+    if not DATABASE_URL:
+        print("ERROR: DATABASE_URL not set.")
+        return None
+    try:
+        cursor_factory = DictCursor if dict_cursor else None
+        return psycopg2.connect(DATABASE_URL, cursor_factory=cursor_factory)
+    except Exception as e:
+        print(f"DB Connection Error: {e}")
+        return None
 
-# Database connection pool (Postgres connections must be synchronous)
-_db_pool = None
+def setup_database_schema():
+    """Initializes the database schema if tables do not exist."""
+    conn = get_sync_db_connection()
+    if not conn:
+        return
 
-def init_db_pool():
-    """Initializes the synchronous connection pool."""
-    global _db_pool
-    if _db_pool is None:
-        try:
-            # Simple connection to start, pool management is complex for this scope
-            # Using simple connection for synchronous pool emulation
-            _db_pool = psycopg2.connect(DATABASE_URL)
-            print("✅ PostgreSQL Client Connected.")
-            create_tables()
-        except Exception as e:
-            print(f"❌ Error connecting to PostgreSQL: {e}")
-            sys.exit(1)
-    return _db_pool
-
-def create_tables():
-    """Creates the necessary tables if they do not exist."""
-    conn = init_db_pool()
-    with conn.cursor() as cur:
-        # services table stores all provider bus data
+    try:
+        cur = conn.cursor()
+        
+        # 1. Bus Services Table (Stores public and private bus info)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS services (
-                id TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS bus_services (
+                id SERIAL PRIMARY KEY,
                 route TEXT NOT NULL,
-                service_name TEXT,
-                driver TEXT,
-                total_seats INTEGER,
-                remaining_seats INTEGER,
-                bus_type TEXT, -- ADDED: Bus type field
-                adult_fare NUMERIC,
-                teacher_fare NUMERIC,
-                child_fare NUMERIC,
-                contact TEXT,
-                payment_methods JSONB,
-                status TEXT
+                service_name TEXT NOT NULL,
+                driver_name TEXT,
+                fare_price DECIMAL(10, 2),
+                contact_number TEXT,
+                departure_time_slot TEXT NOT NULL, -- e.g., '06:00-07:00'
+                status TEXT DEFAULT 'active', -- 'active' or 'unavailable'
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        # sessions table stores temporary user session data
+        
+        # 2. Bookings Table
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                chat_id TEXT PRIMARY NULL,
-                data JSONB
+            CREATE TABLE IF NOT EXISTS bookings (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                bus_id INTEGER REFERENCES bus_services(id),
+                route TEXT NOT NULL,
+                time_slot TEXT NOT NULL,
+                booking_time TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        
+        # 3. Insert initial Public Bus services if none exist for popular routes
+        cur.execute("SELECT COUNT(*) FROM bus_services WHERE service_name = 'Public Bus'")
+        count = cur.fetchone()[0]
+        
+        if count == 0:
+            print("Inserting initial public bus data...")
+            initial_services = [
+                ('Badulla-Kandy', 'Public Bus', 'Govt Driver 1', 150.00, '0771234567', '06:00-07:00'),
+                ('Badulla-Kandy', 'Public Bus', 'Govt Driver 2', 155.00, '0772345678', '08:00-09:00'),
+                ('Badulla-Kandy', 'Public Bus', 'Govt Driver 3', 145.00, '0773456789', '12:00-13:00'),
+            ]
+            
+            insert_query = """
+                INSERT INTO bus_services (route, service_name, driver_name, fare_price, contact_number, departure_time_slot)
+                VALUES (%s, %s, %s, %s, %s, %s);
+            """
+            cur.executemany(insert_query, initial_services)
+            print("Initial public bus data inserted.")
+
         conn.commit()
-    print("✅ PostgreSQL Tables Verified/Created.")
-
-# Initialize the connection pool on startup
-init_db_pool()
-
-# --- PostgreSQL Data Persistence Helpers (Asynchronous Wrappers) ---
-# We use asyncio.to_thread to run synchronous psycopg2 calls safely
-
-async def get_session_async(chat_id):
-    """Retrieves session data from Postgres."""
-    def _fetch():
-        conn = _db_pool
-        with conn.cursor(cursor_factory=DictCursor) as cur:
-            cur.execute("SELECT data FROM sessions WHERE chat_id = %s;", (str(chat_id),))
-            row = cur.fetchone()
-            return row['data'] if row else {}
-    try:
-        return await asyncio.to_thread(_fetch)
+        cur.close()
     except Exception as e:
-        print(f"Error getting session for {chat_id}: {e}")
-        return {}
+        print(f"Database setup or initial data insertion failed: {e}")
+    finally:
+        if conn:
+            conn.close()
 
-async def save_session_async(chat_id, data):
-    """Saves or updates session data to Postgres."""
-    def _execute():
-        conn = _db_pool
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO sessions (chat_id, data) 
-                VALUES (%s, %s)
-                ON CONFLICT (chat_id) DO UPDATE 
-                SET data = EXCLUDED.data;
-                """,
-                (str(chat_id), Json(data))
-            )
-            conn.commit()
+# Run database setup on script initialization
+setup_database_schema()
+
+# --- Helper Functions ---
+
+def get_departure_time_slot(time_str):
+    """Converts HH:MM string to a 1-hour time slot string (e.g., '07:00' -> '07:00-08:00')."""
     try:
-        await asyncio.to_thread(_execute)
-    except Exception as e:
-        print(f"Error saving session for {chat_id}: {e}")
+        hour = int(time_str.split(':')[0])
+        start_time = f"{hour:02d}:00"
+        end_time = f"{(hour + 1) % 24:02d}:00"
+        return f"{start_time}-{end_time}"
+    except Exception:
+        return None
 
-async def clear_session_async(chat_id):
-    """Deletes session data from Postgres."""
-    def _execute():
-        conn = _db_pool
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM sessions WHERE chat_id = %s;", (str(chat_id),))
-            conn.commit()
+def get_fare_prediction(data):
+    """Placeholder for Vertex AI prediction or simple fallback."""
+    default_fare = 150.00
+    estimated_fare = default_fare
+
+    if not GCP_LIBRARIES_AVAILABLE:
+        return estimated_fare
+
+    if not all([PROJECT_ID, MODEL_ENDPOINT_ID]):
+        return estimated_fare
+
     try:
-        await asyncio.to_thread(_execute)
+        # Simulated Prediction based on route length/time
+        route = data.get('route', '')
+        if 'colombo' in route.lower():
+            estimated_fare = 500.00
+        elif 'kandy' in route.lower():
+            estimated_fare = 150.00
+        else:
+            estimated_fare = 100.00
+            
+        return estimated_fare
+        
     except Exception as e:
-        print(f"Error clearing session for {chat_id}: {e}")
+        print(f"AI Prediction failed (falling back to default): {e}")
+        return default_fare
 
-async def get_all_services_async():
-    """Retrieves all provider services from Postgres."""
-    def _fetch():
-        conn = _db_pool
-        services = []
-        with conn.cursor(cursor_factory=DictCursor) as cur:
-            cur.execute("SELECT * FROM services;")
-            for row in cur.fetchall():
-                # Convert DictRow to standard dict and ensure numeric fields are converted
-                service_dict = dict(row)
-                for key in ['adult_fare', 'teacher_fare', 'child_fare']:
-                    if key in service_dict and service_dict[key] is not None:
-                         service_dict[key] = float(service_dict[key])
-                services.append(service_dict)
-            return {"services": services}
+
+# --- DB Sync Operations (Provider Logic) ---
+
+def sync_add_service(data):
+    """Saves a new bus service entry to the database."""
+    conn = get_sync_db_connection()
+    if not conn: return None
+
     try:
-        return await asyncio.to_thread(_fetch)
+        cur = conn.cursor()
+        time_slot = get_departure_time_slot(data['departure_time'])
+        if not time_slot: raise ValueError("Invalid departure time format.")
+            
+        insert_query = """
+            INSERT INTO bus_services (
+                route, service_name, driver_name, fare_price, contact_number, departure_time_slot
+            ) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id;
+        """
+        
+        cur.execute(insert_query, (
+            data['route'], 
+            data['service_name'], 
+            data['driver_name'], 
+            data['fare_price'], 
+            data['contact_number'],
+            time_slot
+        ))
+        
+        bus_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        return bus_id
     except Exception as e:
-        print(f"Error getting all services: {e}")
-        return {"services": []}
+        print(f"Error saving new bus service: {e}")
+        return None
+    finally:
+        if conn: conn.close()
 
-async def save_new_service_async(service_data):
-    """Adds a new service to Postgres."""
-    def _execute():
-        conn = _db_pool
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO services (id, route, service_name, driver, total_seats, remaining_seats, bus_type, adult_fare, teacher_fare, child_fare, contact, payment_methods, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
-                """,
-                (
-                    service_data['id'], service_data['route'], service_data['service_name'], service_data['driver'], 
-                    service_data['total_seats'], service_data['remaining_seats'], service_data['bus_type'], # Updated to include bus_type
-                    service_data['adult_fare'], 
-                    service_data['teacher_fare'], service_data['child_fare'], service_data['contact'], 
-                    Json(service_data['payment_methods']), service_data['status']
-                )
-            )
-            conn.commit()
+def sync_update_service(service_id, update_data):
+    """Updates status or other fields of an existing bus service."""
+    conn = get_sync_db_connection()
+    if not conn: return False
+
     try:
-        await asyncio.to_thread(_execute)
-    except Exception as e:
-        print(f"Error saving new service: {e}")
-
-async def update_service_status_and_seats_async(service_id, update_data):
-    """Updates status or seat count for an existing service."""
-    def _execute():
-        conn = _db_pool
-        # Build dynamic UPDATE query
-        set_clauses = []
-        values = []
+        cur = conn.cursor()
+        
+        # Build dynamic SET clause
+        set_parts = []
+        data_values = []
         for key, value in update_data.items():
-            set_clauses.append(f"{key} = %s")
-            # Handle JSONB for payment methods if necessary, though unlikely here
-            values.append(value) 
-
-        if not set_clauses: return # Nothing to update
+            set_parts.append(f"{key} = %s")
+            data_values.append(value)
         
-        sql = f"UPDATE services SET {', '.join(set_clauses)} WHERE id = %s;"
-        values.append(service_id)
+        data_values.append(service_id)
         
-        with conn.cursor() as cur:
-            cur.execute(sql, tuple(values))
-            conn.commit()
-    try:
-        await asyncio.to_thread(_execute)
+        update_query = f"UPDATE bus_services SET {', '.join(set_parts)} WHERE id = %s;"
+        
+        cur.execute(update_query, data_values)
+        conn.commit()
+        cur.close()
+        return True
     except Exception as e:
         print(f"Error updating service {service_id}: {e}")
+        return False
+    finally:
+        if conn: conn.close()
 
+def sync_get_all_services(user_id=None):
+    """Retrieves all services."""
+    conn = get_sync_db_connection(dict_cursor=True)
+    if not conn: return {'services': []}
 
-# --- Synchronous Wrappers for Handlers ---
-# Since telebot handlers are synchronous, we run the async functions inside them.
-
-def sync_get_session(chat_id): return asyncio.run(get_session_async(chat_id))
-def sync_save_session(chat_id, data): asyncio.run(save_session_async(chat_id, data))
-def sync_clear_session(chat_id): asyncio.run(clear_session_async(chat_id))
-def sync_get_all_services(): return asyncio.run(get_all_services_async())
-def sync_save_new_service(data): asyncio.run(save_new_service_async(data))
-def sync_update_service(service_id, update_data): asyncio.run(update_service_status_and_seats_async(service_id, update_data))
-
-
-# --- CSV & Data Loading (Remains Local for Bus Routes) ---
-
-def time_to_minutes(t: str):
-    m = re.match(r'^(\d{1,2}):(\d{2})$', t)
-    if not m: return None
-    try: return int(m.group(1)) * 60 + int(m.group(2))
-    except ValueError: return None
-
-def generate_departure_times(time_slot, interval_minutes=60):
-    m = re.match(r'(\d{1,2}:\d{2})-(\d{1,2}:\d{2})', str(time_slot))
-    if not m: return []
-    start_str, end_str = m.groups()
     try:
-        start_time = datetime.strptime(start_str, '%H:%M')
-        end_time = datetime.strptime(end_str, '%H:%M')
-    except ValueError: return []
-    
-    times = []
-    current_time = start_time
-    while current_time <= end_time:
-        times.append(current_time.strftime('%H:%M'))
-        current_time += timedelta(minutes=interval_minutes)
-    return times
-
-def load_bus_data(csv_file_path):
-    if not os.path.exists(csv_file_path): return []
-    try:
-        df = pd.read_csv(csv_file_path)
-    except Exception as e: 
-        print(f"Error loading CSV data: {e}")
-        return []
-    
-    unique_bus_cols = [c for c in ['route_id', 'bus_route', 'bus_type_num', 'direction'] if c in df.columns]
-    if not unique_bus_cols: 
-        print("Warning: CSV is missing required columns (route_id, bus_route, etc.)")
-        return []
-
-    df_unique = df.groupby(unique_bus_cols).agg(times=('time_slot', lambda x: list(x.dropna().unique()))).reset_index()
-    
-    bus_data_list = []
-    bus_id_counter = 1
-    for _, row in df_unique.iterrows():
-        all_times = set()
-        for slot in row.get('times', []): 
-            all_times.update(generate_departure_times(slot))
-            
-        if not all_times: continue
+        cur = conn.cursor()
+        cur.execute("SELECT id, route, service_name, driver_name, fare_price, departure_time_slot, status FROM bus_services ORDER BY created_at DESC;")
         
-        sorted_times = sorted(list(all_times), key=lambda s: time_to_minutes(s))
+        results = cur.fetchall()
+        cur.close()
         
-        bus_data_list.append({
-            'id': f'BUS-{bus_id_counter}',
-            'route_id': row.get('route_id'),
-            'name': row.get('bus_route') if 'bus_route' in row else str(row.get('route_id')),
-            'bus_type_num': int(row.get('bus_type_num')) if 'bus_type_num' in row and pd.notna(row.get('bus_type_num')) else 1,
-            'capacity': 50, # Default capacity for CSV/Public bus
-            'times': sorted_times
-        })
-        bus_id_counter += 1
-    return bus_data_list
+        services_list = []
+        for row in results:
+            service = dict(row) 
+            if service['fare_price'] is not None:
+                 service['fare_price'] = str(service['fare_price'])
+            services_list.append(service)
 
-def get_all_routes():
-    # Load all dynamic services from Postgres
-    services_db = sync_get_all_services()
-    
-    csv_routes = set()
-    try:
-        csv_routes = {b.get('name') for b in buses if b.get('name')}
-    except Exception: pass
-    
-    # Include routes from the persistent provider database
-    json_routes = {s['route'] for s in services_db.get('services', [])}
-    
-    return sorted(list(csv_routes.union(json_routes)))
-
-# Load bus data on startup
-buses = load_bus_data(CSV_FILE_PATH)
-ROUTE_NAMES = get_all_routes()
-
-
-# --- Vertex AI/Fare Prediction Initialization ---
-GCP_PROJECT_ID = os.getenv('GCP_PROJECT_ID')
-GCP_LOCATION = os.getenv('GCP_LOCATION')
-VERTEX_ENDPOINT_ID = os.getenv('VERTEX_ENDPOINT_ID')
-CREDENTIALS_JSON = os.getenv('GOOGLE_CREDENTIALS_JSON')
-
-vertex_predictor = None
-
-if GCP_LIBRARIES_AVAILABLE and all([GCP_PROJECT_ID, GCP_LOCATION, VERTEX_ENDPOINT_ID, CREDENTIALS_JSON]):
-    try:
-        credentials_info = json.loads(CREDENTIALS_JSON)
-        credentials = service_account.Credentials.from_service_account_info(credentials_info)
-        aiplatform.init(project=GCP_PROJECT_ID, location=GCP_LOCATION, credentials=credentials)
-        vertex_predictor = aiplatform.Endpoint(endpoint_name=VERTEX_ENDPOINT_ID) 
-        print("✅ Vertex AI Prediction Endpoint Initialized.")
-
+        return {'services': services_list}
     except Exception as e:
-        print(f"❌ Error initializing Vertex AI. Falling back to local calculation. Error: {e}")
-        vertex_predictor = None 
+        print(f"Error fetching all services: {e}")
+        return {'services': []}
+    finally:
+        if conn: conn.close()
 
+# --- DB Sync Operations (Passenger Logic) ---
 
-# --- Fare Calculation Logic ---
-def get_fare_prediction_safe(data, predictor):
+def sync_search_matching_services(route, time_slot_str):
     """
-    Calculates/Predicts a simple standard adult fare for CSV/Public buses.
+    Searches the database for all active bus services matching the route and time slot.
+    
+    *** CONFIRMED FIX: No restrictive filter on service_name. ***
     """
-    
-    try: 
-        distance_km = float(data.get('distance_km', DEFAULT_DISTANCE_KM))
-        # Simple count of passengers for basic prediction
-        pass_count = len(data.get('passenger_ages', [])) or 1 
-    except Exception: 
-        distance_km = DEFAULT_DISTANCE_KM
-        pass_count = 1
+    time_slot = get_departure_time_slot(time_slot_str)
+    if not time_slot:
+        return []
+
+    conn = get_sync_db_connection(dict_cursor=True)
+    if not conn: return []
+
+    try:
+        cur = conn.cursor()
         
-    # Local Fallback Calculation (A simple standard adult fare prediction)
-    base = 20.0 * pass_count 
-    per_km = 5.0 
-    traffic_mult = 1.0 # Simplified
-    fare = max(5.0, round((base + distance_km * per_km) * traffic_mult, 2))
-    
-    # Return the simple predicted fare for display purposes before booking
-    return fare
-
-def calculate_final_fare(bus_data, passenger_ages):
-    """Calculates the final fare based on passenger ages and bus's fare structure."""
-    if not passenger_ages: return 0.0
-    
-    total_fare = 0.0
-    
-    # 1. Private/Provider Bus Fare
-    if bus_data.get('type') == 'PROVIDER':
-        # Safely convert fares to float, defaulting to 0.0 if missing/invalid
-        try: adult_fare = float(bus_data.get('adult_fare', 0.0))
-        except ValueError: adult_fare = 0.0
+        # This query retrieves ALL active services matching the route and time slot.
+        sql_query = """
+            SELECT id, route, service_name, fare_price, departure_time_slot
+            FROM bus_services
+            WHERE route = %s AND departure_time_slot = %s AND status = 'active'; 
+        """
         
-        try: teacher_fare = float(bus_data.get('teacher_fare', adult_fare))
-        except ValueError: teacher_fare = adult_fare
+        cur.execute(sql_query, (route, time_slot))
         
-        try: child_fare = float(bus_data.get('child_fare', adult_fare))
-        except ValueError: child_fare = adult_fare
+        results = cur.fetchall()
+        cur.close()
         
-        for age in passenger_ages:
-            # Classification based on assumed standard fare categories
-            if age > 12: # Adults and Teachers (Lacking input to distinguish teacher/adult)
-                total_fare += adult_fare 
-            elif age > 0 and age <= 12: # Children 
-                total_fare += child_fare
-            # Age 0 or less (infant free, etc.) is zero fare
-            
-        return round(total_fare, 2)
+        buses = []
+        for row in results:
+            bus = dict(row)
+            if bus['fare_price'] is not None:
+                 bus['fare_price'] = str(bus['fare_price'])
+            buses.append(bus)
         
-    # 2. Public/CSV Bus Fare 
-    else: 
-        # Fallback to the single predicted fare (already calculated for the group)
-        return bus_data.get('fare', 0.0)
+        return buses
+        
+    except Exception as e:
+        print(f"Error searching matching buses: {e}")
+        return []
+    finally:
+        if conn: conn.close()
 
+def sync_save_booking(user_id, bus_id, route, time_slot):
+    """Saves a successful booking to the database."""
+    conn = get_sync_db_connection()
+    if not conn: return False
 
-# --- Bot Initialization ---
-bot = telebot.TeleBot(BOT_TOKEN, threaded=False) if BOT_TOKEN else None
+    try:
+        cur = conn.cursor()
+        
+        insert_query = """
+            INSERT INTO bookings (user_id, bus_id, route, time_slot)
+            VALUES (%s, %s, %s, %s);
+        """
+        
+        cur.execute(insert_query, (user_id, bus_id, route, time_slot))
+        conn.commit()
+        cur.close()
+        return True
+    except Exception as e:
+        print(f"Error saving booking: {e}")
+        return False
+    finally:
+        if conn: conn.close()
 
-# --- KEYBOARDS & UI HELPERS ---
+# --- Telegram Handlers (Conversation Flow) ---
 
-def main_menu_keyboard():
-    markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        InlineKeyboardButton("👤 Passenger", callback_data="role_passenger"),
-        InlineKeyboardButton("🚌 Bus Provider", callback_data="role_provider")
-    )
-    markup.add(
-        InlineKeyboardButton("❌ Exit Program", callback_data="program_exit")
-    )
-    return markup
-
-def provider_menu_keyboard():
-    markup = InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        InlineKeyboardButton("➕ Add New Service", callback_data="prov_add"),
-        InlineKeyboardButton("🗑️ Change Status (Toggle Availability)", callback_data="prov_status"),
-        InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")
-    )
-    return markup
-
-def passenger_count_keyboard():
-    markup = InlineKeyboardMarkup(row_width=3)
-    btns = [InlineKeyboardButton(str(i), callback_data=f"pass_count_{i}") for i in range(1, 7)]
-    markup.add(*btns)
-    markup.add(InlineKeyboardButton("7+", callback_data="pass_count_7+"))
-    return markup
-
-def payment_toggle_keyboard(current_selection):
-    w_status = "✅" if "weekly" in current_selection else "⬜"
-    m_status = "✅" if "monthly" in current_selection else "⬜"
-    
-    markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        InlineKeyboardButton(f"{w_status} Weekly", callback_data="toggle_pay_weekly"),
-        InlineKeyboardButton(f"{m_status} Monthly", callback_data="toggle_pay_monthly")
-    )
-    markup.add(InlineKeyboardButton("💾 Save & Finish", callback_data="prov_save_service"))
-    return markup
-
-def send_error_message(chat_id):
-    """Sends a standardized error/help message for invalid input."""
-    bot.send_message(
-        chat_id, 
-        "🚫 **Invalid Input!**\n\nI was expecting data for a specific step, or the `/start` command.\n\n"
-        "Please use the menu below or type `/start` to begin a new process.",
-        reply_markup=main_menu_keyboard(),
-        parse_mode='Markdown'
-    )
-
-def edit_and_answer(call, text, reply_markup=None):
-    """Helper to edit the message and answer the callback query, setting Markdown mode."""
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, 
-                          reply_markup=reply_markup, parse_mode='Markdown')
-    bot.answer_callback_query(call.id)
-
-
-# --- MESSAGE HANDLERS (Text Input) ---
-
-@bot.message_handler(commands=['start', 'help'])
+@bot.message_handler(commands=['start'])
 def send_welcome(message):
-    sync_clear_session(message.chat.id)
-    bot.send_message(
-        message.chat.id, 
-        "👋 **Welcome to routAfare!**\n\nPlease select your role:",
-        reply_markup=main_menu_keyboard(),
-        parse_mode='Markdown'
-    )
+    """Handles the /start command and asks the user for their role."""
+    chat_id = message.chat.id
+    user_states[chat_id] = {'stage': 'AWAITING_ROLE'}
 
-@bot.message_handler(func=lambda m: True)
-def handle_text(message):
-    chat_id = str(message.chat.id)
+    markup = telebot.types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True, one_time_keyboard=True)
+    item_passenger = telebot.types.KeyboardButton('🧑 Passenger')
+    item_provider = telebot.types.KeyboardButton('🚌 Bus Provider')
+    markup.add(item_passenger, item_provider)
+
+    bot.send_message(chat_id, "👋 Welcome to RoutAfare!\nPlease select your role:", reply_markup=markup)
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_ROLE')
+def handle_role_selection(message):
+    """Processes the role selection and moves to the next stage."""
+    chat_id = message.chat.id
+    role = message.text.lower().strip()
+    
+    markup = telebot.types.ReplyKeyboardRemove(selective=False)
+    
+    if 'passenger' in role:
+        user_states[chat_id] = {'stage': 'AWAITING_ROUTE_PASSENGER'}
+        bot.send_message(chat_id, "📍 Enter your **Route** (e.g., Badulla-Kandy):", reply_markup=markup, parse_mode='Markdown')
+        
+    elif 'bus provider' in role:
+        user_states[chat_id] = {'stage': 'AWAITING_PROVIDER_PASSWORD'}
+        bot.send_message(chat_id, "🔒 Enter Provider Password:", reply_markup=markup)
+        
+    else:
+        bot.send_message(chat_id, "Please select a valid role.")
+
+# --- Passenger Workflow ---
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_ROUTE_PASSENGER')
+def handle_passenger_route(message):
+    """Saves the route and asks for departure time."""
+    chat_id = message.chat.id
+    user_states[chat_id]['route'] = message.text.strip()
+    user_states[chat_id]['stage'] = 'AWAITING_TIME_PASSENGER'
+    
+    bot.send_message(chat_id, "⏰ Enter your approximate departure time in HH:MM (example: 13:45):")
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_TIME_PASSENGER')
+def handle_passenger_time(message):
+    """Processes time, searches buses, and presents booking options."""
+    chat_id = message.chat.id
+    time_str = message.text.strip()
+    
+    try:
+        # Basic time validation
+        datetime.strptime(time_str, '%H:%M')
+        
+        user_states[chat_id]['departure_time'] = time_str
+        route = user_states[chat_id]['route']
+        
+        bot.send_message(chat_id, "Calculating fare and searching for matching services... 🔍")
+        
+        # 1. Get Estimated Fare
+        fare_data = {'route': route, 'time': time_str} 
+        estimated_fare = get_fare_prediction(fare_data)
+        
+        # 2. Search for Buses (The fixed query is used here)
+        matching_buses = sync_search_matching_services(route, time_str)
+        
+        if not matching_buses:
+            bot.send_message(chat_id, f"😥 No active bus services found for Route: **{route}** around **{time_str}**.", parse_mode='Markdown')
+            user_states[chat_id] = {} # End session
+            return
+
+        # 3. Prepare Display and Keyboard
+        departure_slot = get_departure_time_slot(time_str)
+        
+        summary_text = (
+            f"🚌 **Your Search Summary**\n"
+            f"Route: **{route}**\n"
+            f"Time: **{time_str}** (Slot: {departure_slot})\n"
+            f"Estimated Fare: Rs\\ **{estimated_fare:.2f}**\n\n"
+            "Select a service to Confirm Booking:"
+        )
+        
+        markup = InlineKeyboardMarkup()
+        
+        for bus in matching_buses:
+            callback_data = f"book_{bus['id']}" 
+            fare_display = f"Rs. {bus['fare_price']}" if bus.get('fare_price') else f"~Rs. {estimated_fare:.2f}"
+            
+            button_text = f"✅ Book: {bus['service_name']} | Fare: {fare_display}"
+            
+            markup.add(InlineKeyboardButton(text=button_text, callback_data=callback_data))
+
+        user_states[chat_id]['stage'] = 'AWAITING_BOOKING_CONFIRMATION'
+        user_states[chat_id]['buses'] = matching_buses
+        
+        bot.send_message(chat_id, summary_text, reply_markup=markup, parse_mode='Markdown')
+
+    except ValueError:
+        bot.send_message(chat_id, "❌ Invalid time format. Please enter time in HH:MM (e.g., 07:00).")
+        
+    except Exception as e:
+        print(f"Error in passenger search: {e}")
+        bot.send_message(chat_id, "An unexpected error occurred during search. Please try again.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('book_'))
+def handle_booking_callback(call):
+    """Handles the user selecting a bus to book."""
+    chat_id = call.message.chat.id
+    
+    if user_states.get(chat_id, {}).get('stage') != 'AWAITING_BOOKING_CONFIRMATION':
+        bot.answer_callback_query(call.id, "Session expired. Please start over with /start.")
+        return
+        
+    bus_id = int(call.data.split('_')[1])
+    
+    selected_bus = next((b for b in user_states[chat_id]['buses'] if b['id'] == bus_id), None)
+
+    if selected_bus:
+        route = user_states[chat_id]['route']
+        time_slot = selected_bus['departure_time_slot']
+        
+        # Save Booking to DB
+        if sync_save_booking(chat_id, bus_id, route, time_slot):
+            
+            # 1. Update the original message
+            try:
+                bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+            except Exception:
+                pass 
+
+            # 2. Send confirmation
+            fare_display = f"Rs. {selected_bus['fare_price']}" if selected_bus.get('fare_price') else "Fare to be confirmed by driver"
+
+            confirmation_text = (
+                "🎉 **BOOKING CONFIRMED!** 🎉\n\n"
+                f"Service: **{selected_bus['service_name']}**\n"
+                f"Route: **{route}**\n"
+                f"Fare: **{fare_display}**\n"
+                f"Departure Slot: **{time_slot}**\n\n"
+                "Thank you for using RoutAfare. Please be ready to board at the departure time."
+            )
+            bot.send_message(chat_id, confirmation_text, parse_mode='Markdown')
+            
+        else:
+            bot.send_message(chat_id, "❌ Sorry, there was a problem confirming your booking in the database. Please try again later.")
+
+    user_states[chat_id] = {} # End session
+    bot.answer_callback_query(call.id, "Booking Confirmed!")
+
+# --- Provider Workflow ---
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_PROVIDER_PASSWORD')
+def handle_provider_password(message):
+    """Verifies the provider password."""
+    chat_id = message.chat.id
+    password = message.text.strip()
+
+    if password == PROVIDER_PASSWORD:
+        user_states[chat_id]['stage'] = 'PROVIDER_MENU'
+        
+        markup = telebot.types.ReplyKeyboardMarkup(row_width=1, resize_keyboard=True, one_time_keyboard=True)
+        markup.add(telebot.types.KeyboardButton('➕ Add Service'))
+        markup.add(telebot.types.KeyboardButton('⚙️ Manage Status'))
+        
+        bot.send_message(chat_id, "Access granted! What would you like to do?", reply_markup=markup)
+    else:
+        bot.send_message(chat_id, "❌ Invalid password. Please try again or type /start to restart.")
+        user_states[chat_id] = {}
+
+# --- Provider Menu Dispatch ---
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'PROVIDER_MENU')
+def handle_provider_menu_dispatch(message):
+    chat_id = message.chat.id
     text = message.text.strip()
     
-    # Retrieve current session data
-    session_data = sync_get_session(chat_id)
-    
-    # List of steps where text input is expected
-    active_steps = [
-        'provider_auth', 'prov_enter_route', 'prov_enter_service_name', 
-        'prov_enter_driver', 'prov_enter_bus_type', 'prov_enter_seats', 'prov_enter_adult_fare', # ADDED: prov_enter_bus_type
-        'prov_enter_teacher_fare', 'prov_enter_child_fare', 'prov_enter_contact', 
-        'await_age', 'await_time'
-    ]
-    
-    current_step = session_data.get('step')
+    if text == '➕ Add Service':
+        user_states[chat_id]['stage'] = 'AWAITING_ROUTE_NAME'
+        # Clear keyboard
+        markup = telebot.types.ReplyKeyboardRemove(selective=False)
+        bot.send_message(chat_id, "Enter the Route Name (e.g., Kandy-Colombo):", reply_markup=markup)
+    elif text == '⚙️ Manage Status':
+        prov_status(message) # Call the handler function directly
+    else:
+        bot.send_message(chat_id, "Please use the buttons provided.")
 
-    # FIX: Robust Error Handling - If not in an active flow, show error/help message
-    if current_step not in active_steps:
-        send_error_message(int(chat_id))
-        return
 
-    # --- PROVIDER AUTH ---
-    if current_step == 'provider_auth':
-        if text == PROVIDER_PASSWORD:
-            session_data['step'] = 'provider_menu'
-            sync_save_session(chat_id, session_data)
-            bot.send_message(int(chat_id), "🔓 **Access Granted**\nManage your fleet:", reply_markup=provider_menu_keyboard(), parse_mode='Markdown')
-        else:
-            bot.send_message(int(chat_id), "❌ Wrong Password. Try again or /start")
+# --- Provider Service Details Collection ---
 
-    # --- PROVIDER ADDING DATA FLOW ---
-    elif current_step == 'prov_enter_route':
-        if 'temp_service' not in session_data: session_data['temp_service'] = {}
-        session_data['temp_service']['route'] = text
-        session_data['step'] = 'prov_enter_service_name' 
-        sync_save_session(chat_id, session_data)
-        bot.send_message(int(chat_id), "🚍 Enter the **Bus Service/Company Name** (e.g., ABC Express, Private Bus):", parse_mode='Markdown')
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_ROUTE_NAME')
+def handle_provider_route_name(message):
+    chat_id = message.chat.id
+    user_states[chat_id]['route'] = message.text.strip()
+    user_states[chat_id]['stage'] = 'AWAITING_SERVICE_NAME'
+    bot.send_message(chat_id, "Enter the **Bus Service/Company Name** (e.g., Starline Express, Private Bus):", parse_mode='Markdown')
 
-    elif current_step == 'prov_enter_service_name':
-        session_data['temp_service']['service_name'] = text
-        session_data['step'] = 'prov_enter_driver'
-        sync_save_session(chat_id, session_data)
-        bot.send_message(int(chat_id), "🧑 Enter **Driver Name**:", parse_mode='Markdown')
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_SERVICE_NAME')
+def handle_provider_service_name(message):
+    chat_id = message.message.chat.id
+    user_states[chat_id]['service_name'] = message.text.strip()
+    user_states[chat_id]['stage'] = 'AWAITING_DRIVER_NAME'
+    bot.send_message(chat_id, "Enter **Driver Name**:")
 
-    elif current_step == 'prov_enter_driver':
-        session_data['temp_service']['driver'] = text
-        session_data['step'] = 'prov_enter_bus_type' # NEW STEP: Bus Type
-        sync_save_session(chat_id, session_data)
-        bot.send_message(int(chat_id), "🚌 Enter the **Bus Type** (e.g., Luxury, Semi-Luxury, Normal):", parse_mode='Markdown')
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_DRIVER_NAME')
+def handle_provider_driver_name(message):
+    chat_id = message.chat.id
+    user_states[chat_id]['driver_name'] = message.text.strip()
+    user_states[chat_id]['stage'] = 'AWAITING_FARE_PRICE'
+    bot.send_message(chat_id, "Enter **Fare Price** (e.g., 150.00):")
 
-    elif current_step == 'prov_enter_bus_type': # NEW HANDLER: Store Bus Type
-        session_data['temp_service']['bus_type'] = text
-        session_data['step'] = 'prov_enter_seats' 
-        sync_save_session(chat_id, session_data)
-        bot.send_message(int(chat_id), "💺 Enter the **Total Number of Seats** available (e.g., 50):", parse_mode='Markdown')
-
-    elif current_step == 'prov_enter_seats':
-        try:
-            seats = int(text)
-            if seats <= 0: raise ValueError
-            session_data['temp_service']['total_seats'] = seats
-            # Seat Management: Set remaining seats immediately
-            session_data['temp_service']['remaining_seats'] = seats 
-            session_data['step'] = 'prov_enter_adult_fare' 
-            sync_save_session(chat_id, session_data)
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_FARE_PRICE')
+def handle_provider_fare_price(message):
+    chat_id = message.chat.id
+    try:
+        if not re.match(r'^\d+(\.\d{1,2})?$', message.text.strip()):
+            raise ValueError
             
-            # Start fare collection flow
-            bot.send_message(int(chat_id), "💵 Enter **Adult/Standard Fare Price** (e.g., 150.00):", parse_mode='Markdown')
-        except ValueError:
-            bot.send_message(int(chat_id), "❌ Invalid number of seats. Please enter a positive whole number.")
+        fare = float(message.text.strip())
+        user_states[chat_id]['fare_price'] = fare
+        user_states[chat_id]['stage'] = 'AWAITING_CONTACT_NUMBER'
+        bot.send_message(chat_id, "Enter **Contact Number** (e.g., 071-XXX-XXXX):")
+    except ValueError:
+        bot.send_message(chat_id, "❌ Invalid fare format. Please enter a valid number (e.g., 150.00).")
 
-    elif current_step == 'prov_enter_adult_fare':
-        try:
-            fare = float(text)
-            session_data['temp_service']['adult_fare'] = fare
-            session_data['step'] = 'prov_enter_teacher_fare' 
-            sync_save_session(chat_id, session_data)
-            # Prompt for Teacher Fare
-            bot.send_message(int(chat_id), "👨‍🏫 Enter **Teacher Fare Price** (e.g., 100.00). Enter the same as Adult Fare if no discount:", parse_mode='Markdown')
-        except ValueError:
-            bot.send_message(int(chat_id), "❌ Invalid fare format. Please enter a number (e.g., 150.00).")
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_CONTACT_NUMBER')
+def handle_provider_contact_number(message):
+    chat_id = message.chat.id
+    contact = message.text.strip()
+    
+    if len(contact) < 5:
+        bot.send_message(chat_id, "❌ Invalid contact format. Please enter a valid number.")
+        return
+        
+    user_states[chat_id]['contact_number'] = contact
+    user_states[chat_id]['stage'] = 'AWAITING_DEPARTURE_TIME'
+    bot.send_message(chat_id, "Enter **Departure Time** in HH:MM (e.g., 06:30):")
 
-    elif current_step == 'prov_enter_teacher_fare':
-        try:
-            fare = float(text)
-            session_data['temp_service']['teacher_fare'] = fare
-            session_data['step'] = 'prov_enter_child_fare' 
-            sync_save_session(chat_id, session_data)
-            # Prompt for Child Fare
-            bot.send_message(int(chat_id), "👶 Enter **Child Fare Price** (e.g., 75.00). Enter 0 if children travel free:", parse_mode='Markdown')
-        except ValueError:
-            bot.send_message(int(chat_id), "❌ Invalid fare format. Please enter a number (e.g., 100.00).")
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_DEPARTURE_TIME')
+def handle_provider_departure_time(message):
+    chat_id = message.chat.id
+    time_str = message.text.strip()
 
-    elif current_step == 'prov_enter_child_fare':
-        try:
-            fare = float(text)
-            session_data['temp_service']['child_fare'] = fare
-            session_data['step'] = 'prov_enter_contact'
-            sync_save_session(chat_id, session_data)
-            # Proceed to contact
-            bot.send_message(int(chat_id), "📞 Enter **Contact Number** (e.g., +9477xxxxxxx):", parse_mode='Markdown')
-        except ValueError:
-            bot.send_message(int(chat_id), "❌ Invalid fare format. Please enter a number (e.g., 75.00).")
-
-
-    elif current_step == 'prov_enter_contact':
-        # Simple validation for a phone number
-        if re.match(r'^\+?[\d\s-]{5,}$', text):
-            session_data['temp_service']['contact'] = text
-            session_data['step'] = 'prov_select_payment'
-            session_data['temp_service']['payment_methods'] = [] 
-            sync_save_session(chat_id, session_data)
-            bot.send_message(
-                int(chat_id), 
-                "💳 **Payment Options**\nToggle allowed methods:",
-                reply_markup=payment_toggle_keyboard([]),
-                parse_mode='Markdown'
+    try:
+        datetime.strptime(time_str, '%H:%M')
+        user_states[chat_id]['departure_time'] = time_str
+        
+        service_data = {
+            'route': user_states[chat_id]['route'],
+            'service_name': user_states[chat_id]['service_name'],
+            'driver_name': user_states[chat_id]['driver_name'],
+            'fare_price': user_states[chat_id]['fare_price'],
+            'contact_number': user_states[chat_id]['contact_number'],
+            'departure_time': time_str 
+        }
+        
+        bus_id = sync_add_service(service_data)
+        
+        if bus_id:
+            time_slot = get_departure_time_slot(time_str)
+            confirmation_text = (
+                "✅ **Service Added Successfully!**\n\n"
+                f"Route: **{service_data['route']}**\n"
+                f"Service: **{service_data['service_name']}** (ID: {bus_id})\n"
+                f"Time Slot: **{time_slot}**\n"
+                f"Fare: Rs\\ **{service_data['fare_price']:.2f}**"
             )
+            bot.send_message(chat_id, confirmation_text, parse_mode='Markdown')
         else:
-            bot.send_message(int(chat_id), "❌ Invalid contact format. Please enter a valid number.")
-
-    # --- PASSENGER AGE INPUT FLOW ---
-    elif current_step == 'await_age':
-        current_data = session_data['data']
-        passengers_to_enter = current_data['passengers_to_enter']
-        current_passenger_num = current_data['current_passenger_num']
+            bot.send_message(chat_id, "❌ Failed to save the service to the database. Please check logs.")
         
-        try:
-            age = int(text)
-            if age < 0 or age > 120: raise ValueError
-            
-            # Store the age
-            current_data['passenger_ages'].append(age)
-            current_data['current_passenger_num'] += 1
-            
-            # Check if all ages are entered
-            if current_data['current_passenger_num'] > passengers_to_enter:
-                # All ages entered, move to time step
-                session_data['step'] = 'await_time'
-                sync_save_session(chat_id, session_data)
-                # Prompt for time
-                bot.send_message(int(chat_id), "⏰ Enter your departure time in **HH:MM** (example: 13:45):", parse_mode='Markdown')
-            else:
-                # Continue asking for the next passenger's age
-                session_data['step'] = 'await_age'
-                sync_save_session(chat_id, session_data)
-                bot.send_message(
-                    int(chat_id), 
-                    f"🧑 Enter the **age** for Passenger #{current_data['current_passenger_num']}:",
-                    parse_mode='Markdown'
-                )
-            
-        except ValueError:
-            bot.send_message(int(chat_id), "❌ Invalid age. Please enter a whole number between 0 and 120.")
-            return
-
-    # --- PASSENGER SEARCH FLOW (Time Input) ---
-    elif current_step == 'await_time':
-        m = re.match(r'^([0-1]?\d|2[0-3]):([0-5]\d)$', text)
-        if not m:
-            bot.send_message(int(chat_id), "❌ Invalid time format. Use HH:MM (e.g., 13:45).")
-            return
-
-        session_data['data']['time'] = text
+        # Return to main provider menu
+        user_states[chat_id]['stage'] = 'PROVIDER_MENU'
+        markup = telebot.types.ReplyKeyboardMarkup(row_width=1, resize_keyboard=True, one_time_keyboard=True)
+        markup.add(telebot.types.KeyboardButton('➕ Add Service'))
+        markup.add(telebot.types.KeyboardButton('⚙️ Manage Status'))
+        bot.send_message(chat_id, "What next?", reply_markup=markup)
         
-        # Predict a simple fare for *display* on CSV/Public routes
-        predicted_fare_placeholder = get_fare_prediction_safe(session_data['data'], vertex_predictor)
-        session_data['data']['predicted_fare'] = predicted_fare_placeholder
-        sync_save_session(chat_id, session_data)
-        
-        bot.send_message(int(chat_id), 'Calculating fare and searching for matching buses... 🔎')
-        
-        s_data = session_data['data']
-        route_name = s_data.get('selected_route')
-        time_input = s_data.get('time')
+    except ValueError:
+        bot.send_message(chat_id, "❌ Invalid time format. Please enter time in HH:MM (e.g., 07:00).")
+    
+    except Exception as e:
+        print(f"Error in provider save flow: {e}")
+        bot.send_message(chat_id, "An unexpected error occurred. Please try /start.")
+        user_states[chat_id] = {}
 
-        # Get the latest services from Postgres
-        services_db = sync_get_all_services()
-        
-        # 1. Search static CSV data
-        csv_matching = [
-            bus for bus in buses 
-            if bus.get('name') == route_name 
-            and time_input in bus.get('times', [])
-        ]
-        
-        # 2. Search dynamic Provider data
-        provider_matching = [
-            svc for svc in services_db.get('services', [])
-            if svc.get('route') == route_name 
-            and svc.get('status') == 'active' # Only show active services
-        ]
-        
-        final_bus_list = []
 
-        # Add CSV buses to the final list
-        for bus in csv_matching:
-            temp_bus_id = f"CSV-{bus['id']}" 
-            bus_details = {
-                'id': temp_bus_id,
-                'type': 'CSV',
-                'name': f"Public Bus ({bus.get('bus_type_num', 1)})",
-                'details_text': f"Scheduled ({', '.join(bus['times'][:2])}...) | Estimated Fare: Rs. {predicted_fare_placeholder}",
-                'fare': predicted_fare_placeholder 
-            }
-            final_bus_list.append(bus_details)
+# --- Provider Status Management ---
 
-        # Add Provider buses to the final list
-        for svc in provider_matching:
-            
-            # --- CALCULATE FARE FOR PROVIDER BUS USING AGE DATA ---
-            mock_bus_data = {
-                'type': 'PROVIDER', 
-                'adult_fare': svc.get('adult_fare', 0.0),
-                'teacher_fare': svc.get('teacher_fare', 0.0),
-                'child_fare': svc.get('child_fare', 0.0)
-            }
-            
-            final_calculated_fare = calculate_final_fare(mock_bus_data, s_data.get('passenger_ages', []))
-            
-            pay_str = ", ".join([p.capitalize() for p in svc.get('payment_methods', [])])
-            # Seat Management: Display remaining seats
-            seats_info = f"Seats: {svc.get('remaining_seats', 'N/A')}" 
-            
-            bus_type = svc.get('bus_type', 'N/A')
-            
-            bus_details = {
-                'id': svc['id'], 
-                'type': 'PROVIDER',
-                'name': f"{svc.get('service_name', 'N/A')} ({bus_type}) | Driver: {svc.get('driver')}", # Included Bus Type
-                'details_text': f"Total Fare: Rs. {final_calculated_fare} | Contact: {svc.get('contact')} | Payment: {pay_str} | {seats_info}", # Explicitly display 'Total Fare'
-                'fare': final_calculated_fare
-            }
-            final_bus_list.append(bus_details)
-
-        if not final_bus_list:
-            bot.send_message(int(chat_id), "❌ No buses found for that route/time.")
-            sync_clear_session(chat_id)
-            return
-
-        session_data['found_buses'] = {b['id']: b for b in final_bus_list}
-        sync_save_session(chat_id, session_data)
-
-        keyboard = InlineKeyboardMarkup()
-        for bus in final_bus_list:
-            keyboard.add(InlineKeyboardButton(f"✅ Book: {bus['name']} - {bus['details_text']}", callback_data=f"confirm_{bus['id']}"))
-
-        fare_text = f"🚌 *Your Search Summary*\nRoute: {route_name}\nTime: {time_input}\nPassengers: {len(s_data.get('passenger_ages', []))}\n\n**Select a bus to Confirm Booking:**"
-        
-        bot.send_message(int(chat_id), fare_text, parse_mode='Markdown', reply_markup=keyboard)
-        session_data['step'] = 'await_bus_select'
-        sync_save_session(chat_id, session_data)
+@bot.message_handler(func=lambda message: message.text == '⚙️ Manage Status')
+def prov_status(message):
+    """Displays the list of services with buttons to toggle their status."""
+    chat_id = message.chat.id
+    
+    # 1. Fetch all services
+    services_db = sync_get_all_services()
+    services = services_db.get('services', [])
+    
+    # Clear the menu keyboard only if there are services to manage
+    if services:
+        markup = telebot.types.ReplyKeyboardRemove(selective=False)
+        # Send a placeholder message to trigger the removal of the old keyboard
+        bot.send_message(chat_id, "Fetching services...", reply_markup=markup) 
+    else:
+        bot.send_message(chat_id, "No services have been registered yet.")
         return
 
-# --- CALLBACK QUERY HANDLER (The Core UI Logic) ---
-
-@bot.callback_query_handler(func=lambda call: True)
-def handle_query(call):
-    chat_id = str(call.message.chat.id)
-    data = call.data
+    # 2. Build the inline keyboard for status toggling
+    status_markup = InlineKeyboardMarkup()
     
-    # Retrieve current session data
-    session_data = sync_get_session(chat_id)
-    
-    def edit_and_answer(call, text, reply_markup=None):
-        """Helper to edit the message and answer the callback query, setting Markdown mode."""
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, 
-                              reply_markup=reply_markup, parse_mode='Markdown')
-        bot.answer_callback_query(call.id)
-
-    # --- 1. MAIN MENU/ROLES ---
-    if data == "menu_main":
-        sync_clear_session(chat_id)
-        edit_and_answer(call, "👋 **Welcome to routAfare!**\n\nPlease select your role:", main_menu_keyboard())
-
-    # --- EXIT OPTION ---
-    elif data == "program_exit":
-        sync_clear_session(chat_id)
-        bot.send_message(
-            int(chat_id), 
-            "👋 **Goodbye!**\n\nYour session has been cleared. Type `/start` to begin a new journey.",
-            parse_mode='Markdown'
+    for svc in services:
+        status = svc.get('status', 'active')
+        emoji = "🟢" if status == 'active' else "🔴"
+        
+        toggle_button = InlineKeyboardButton(
+            text=f"{emoji} {svc['service_name']} ({svc['route']}) | Status: {status.upper()}",
+            callback_data=f"toggle_status_{svc['id']}"
         )
+        status_markup.add(toggle_button)
+
+    # 3. Send the updated status message
+    bot.send_message(
+        chat_id,
+        "**Toggle Service Status:**\n\nTap a button to switch the service between ACTIVE (available for booking) and UNAVAILABLE.",
+        reply_markup=status_markup,
+        parse_mode='Markdown'
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('toggle_status_'))
+def handle_status_toggle(call):
+    """Handles the callback for toggling the service status."""
+    chat_id = call.message.chat.id
+    s_id = int(call.data.split('_')[-1])
+
+    # 1. Fetch current status
+    services_db = sync_get_all_services()
+    svc = next((s for s in services_db['services'] if s['id'] == s_id), None)
+    
+    if svc:
+        # 2. Determine new status
+        new_status = 'unavailable' if svc.get('status') == 'active' else 'active'
+        
+        # 3. Update Postgres table
+        sync_update_service(s_id, {'status': new_status})
+        
+        # 4. Refresh the status menu by sending the prov_status message again
+        
+        # Edit the original message to remove the old inline keyboard
         try:
-            bot.delete_message(call.message.chat.id, call.message.message_id) 
+            bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+            bot.edit_message_text(f"Updating status for {svc['service_name']}...", chat_id, call.message.message_id)
         except Exception:
             pass
-        bot.answer_callback_query(call.id, "Exiting program.")
-        return
-
-    elif data == "role_passenger":
-        # Ensure we get the latest routes which may include new Postgres services
-        routes = get_all_routes()
-        if not routes:
-            bot.answer_callback_query(call.id, "No routes available. Contact the admin.")
-            return
-            
-        session_data = {'step': 'pass_select_route', 'data': {}}
-        sync_save_session(chat_id, session_data)
         
-        kb = InlineKeyboardMarkup(row_width=2)
-        for r in routes:
-            kb.add(InlineKeyboardButton(r, callback_data=f"route_{r}"))
-        kb.add(InlineKeyboardButton("🔙 Back", callback_data="menu_main"))
+        # Re-send the status menu message
+        prov_status(call.message) 
+        bot.answer_callback_query(call.id, f"Status set to {new_status.upper()}")
         
-        edit_and_answer(call, "📍 **Select your Route:**", kb)
+    else:
+        bot.answer_callback_query(call.id, "Service not found.")
+    
+    return 
 
-    elif data == "role_provider":
-        session_data = {'step': 'provider_auth'}
-        sync_save_session(chat_id, session_data)
-        # Delete the previous menu message to prompt password entry
-        bot.delete_message(call.message.chat.id, call.message.message_id) 
-        bot.send_message(int(chat_id), "🔒 Enter **Provider Password**:", parse_mode='Markdown')
-        bot.answer_callback_query(call.id)
-        return
+# --- FLASK/WEBHOOK SETUP ---
 
-    # --- 2. PASSENGER FLOW (Booking Confirmation) ---
-    elif data.startswith("route_"):
-        route = data.split("_")[1]
-        session_data['data']['selected_route'] = route
-        session_data['step'] = 'pass_count'
-        sync_save_session(chat_id, session_data)
-        edit_and_answer(call, f"Selected: **{route}**\n\n👥 **How many passengers?**", passenger_count_keyboard())
+app = Flask(__name__)
 
-    elif data.startswith("pass_count_"):
-        count_str = data.replace("pass_count_", "").replace('+', '')
+@app.route(WEBHOOK_URL_PATH, methods=['POST'])
+def webhook():
+    """Receives updates from Telegram and passes them to the bot."""
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return '!', 200
+    else:
+        return '', 200 
+
+@app.route('/')
+def index():
+    """A simple index page to confirm the Flask app is running and webhook is set."""
+    if BOT_TOKEN and WEBHOOK_URL_BASE:
+        webhook_url = f"{WEBHOOK_URL_BASE}{WEBHOOK_URL_PATH}"
         try:
-            count = int(count_str)
-        except ValueError:
-            count = 1 
-
-        session_data['data']['passengers'] = count_str
-        session_data['data']['passengers_to_enter'] = count
-        session_data['data']['current_passenger_num'] = 1
-        session_data['data']['passenger_ages'] = [] 
-        session_data['step'] = 'await_age' 
-        sync_save_session(chat_id, session_data)
-        
-        edit_and_answer(
-            call, 
-            f"👥 **Passenger Ages**\n\nEnter the **age** for Passenger #1:",
-            None
-        )
-
-    elif data.startswith("confirm_"):
-        # --- BOOKING CONFIRMATION AND SEAT DEDUCTION ---
-        bus_id = data.replace('confirm_', '', 1)
-        found_buses = session_data.get('found_buses', {})
-        selected_bus = found_buses.get(bus_id)
-        
-        if not selected_bus:
-            edit_and_answer(call, "❌ Error: Bus details not found. Starting over.", main_menu_keyboard())
-            sync_clear_session(chat_id)
-            return
-
-        pass_count = session_data['data'].get('passengers_to_enter', 1)
-        
-        seats_remaining_msg = ""
-        final_fare_to_display = selected_bus['fare']
-        contact = "N/A"
-        
-        if selected_bus['type'] == 'PROVIDER':
-            
-            # Fetch the latest services data directly from Postgres
-            services_db = sync_get_all_services()
-            
-            # Find the actual service object in the services list
-            svc = next((s for s in services_db['services'] if s['id'] == selected_bus['id']), None)
-            
-            if svc:
-                contact = svc.get('contact', 'N/A')
-                current_seats = svc.get('remaining_seats', svc.get('total_seats', 50))
-                
-                if current_seats < pass_count:
-                    # Fail the booking due to lack of seats
-                    bot.answer_callback_query(call.id, "❌ Not enough seats remaining on this service.", show_alert=True)
-                    return 
-                    
-                # Seat Management: Update seat count and save to Postgres
-                new_seats = current_seats - pass_count
-                
-                # Update Postgres document with new remaining seats
-                sync_update_service(svc['id'], {'remaining_seats': new_seats})
-                
-                seats_remaining_msg = f"💺 **Final Seats Remaining:** {new_seats}" # Display final remaining seats
-            else:
-                 bot.answer_callback_query(call.id, "❌ Service not found in database.", show_alert=True)
-                 return
-        elif selected_bus['type'] == 'CSV':
-            seats_remaining_msg = "💺 **Seat availability for Public Bus is estimated.**"
-
-
-        fare_display = f"Rs. {final_fare_to_display}" if final_fare_to_display != 'N/A' else "Estimated (Check operator)"
-
-        confirmation_message = (
-            f"✅ **BOOKING CONFIRMED for {pass_count} passenger(s)!** 🎉\n\n"
-            f"🚍 **Service:** {selected_bus['name']}\n"
-            f"💲 **Total Predicted Bus Fare:** {fare_display}\n" # Explicitly display total predicted fare
-            f"📞 **Contact:** {contact}\n"
-            f"{seats_remaining_msg}\n\n"
-            f"Thank you for using RoutAfare. Please be ready to board at the departure time."
-        )
-
-        edit_and_answer(call, confirmation_message, InlineKeyboardMarkup().add(InlineKeyboardButton("🔄 New Search", callback_data="menu_main")))
-        sync_clear_session(chat_id)
-        return
-
-    # --- 3. PROVIDER MENU FLOW ---
-    elif data == "prov_add":
-        session_data['step'] = 'prov_enter_route'
-        session_data['temp_service'] = {}
-        sync_save_session(chat_id, session_data)
-        edit_and_answer(call, "🆕 **Add Service**\n\nEnter the **Route Name** (e.g., Kandy-Colombo):")
-
-    elif data.startswith("toggle_pay_"):
-        method = data.replace("toggle_pay_", "")
-        current = session_data['temp_service'].get('payment_methods', [])
-        
-        if method in current: current.remove(method)
-        else: current.append(method)
-            
-        session_data['temp_service']['payment_methods'] = current
-        sync_save_session(chat_id, session_data)
-        
-        # Only edit the reply markup, not the text
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, 
-                                      reply_markup=payment_toggle_keyboard(current))
-        bot.answer_callback_query(call.id)
-        return
-
-    elif data == "prov_save_service":
-        new_service = session_data['temp_service']
-        # Use a timestamp as a simple unique ID
-        new_service['id'] = str(int(time.time())) 
-        new_service['status'] = 'active'
-        
-        # Ensure prices and seats are stored as numbers 
-        new_service['total_seats'] = int(new_service.get('total_seats', 50))
-        new_service['remaining_seats'] = new_service['total_seats'] 
-        new_service['adult_fare'] = float(new_service.get('adult_fare', 0.0))
-        new_service['teacher_fare'] = float(new_service.get('teacher_fare', new_service['adult_fare']))
-        new_service['child_fare'] = float(new_service.get('child_fare', 0.0))
-        
-        # Ensure bus_type exists
-        if 'bus_type' not in new_service:
-             new_service['bus_type'] = 'Standard'
-
-        sync_save_new_service(new_service) # Save the new service to Postgres
-        
-        edit_and_answer(call, "✅ **Service Saved Successfully!**", provider_menu_keyboard())
-        sync_clear_session(chat_id)
-        return
-
-    elif data == "prov_status" or data == "provider_menu_return":
-        # Get the latest services from Postgres
-        services_db = sync_get_all_services()
-        
-        if not services_db['services']:
-            bot.answer_callback_query(call.id, "No services added yet.")
-            return
-
-        kb = InlineKeyboardMarkup()
-        for svc in services_db['services']:
-            status_icon = "🟢 ACTIVE" if svc.get('status') == 'active' else "🔴 UNAVAILABLE"
-            # Show seats remaining in the status view
-            seats_info = f"({svc.get('remaining_seats', 'N/A')} seats)"
-            kb.add(InlineKeyboardButton(f"{svc['service_name']} - {svc['route']} {seats_info} ({status_icon})", 
-                                         callback_data=f"toggle_stat_{svc['id']}"))
-        kb.add(InlineKeyboardButton("🔙 Back to Provider Menu", callback_data="provider_menu_return"))
-        
-        edit_and_answer(call, "Tap a service to **toggle availability** (Holiday/Weather):", kb)
-        return
-
-    elif data.startswith("toggle_stat_"):
-        # --- TOGGLE SERVICE STATUS LOGIC ---
-        s_id = data.split("_")[2]
-        
-        # 1. Fetch current status
-        services_db = sync_get_all_services()
-        svc = next((s for s in services_db['services'] if s['id'] == s_id), None)
-        
-        if svc:
-            # 2. Determine new status
-            new_status = 'unavailable' if svc.get('status') == 'active' else 'active'
-            
-            # 3. Update Postgres table
-            sync_update_service(s_id, {'status': new_status})
-            
-            # 4. Re-display the status menu
-            # Re-calling prov_status logic to refresh the keyboard
-            handle_query(call._replace(data="prov_status")) 
-        else:
-            bot.answer_callback_query(call.id, "Service not found.")
-        
-        return 
-
-# --- FLASK/WEBHOOK SETUP (Assuming deployment on a platform like Render) ---
-if BOT_TOKEN and WEBHOOK_URL_BASE:
-    app = Flask(__name__)
-    
-    @app.route(WEBHOOK_URL_PATH, methods=['POST'])
-    def webhook():
-        if request.headers.get('content-type') == 'application/json':
-            json_string = request.get_data().decode('utf-8')
-            update = telebot.types.Update.de_json(json_string)
-            bot.process_new_updates([update])
-            return '!', 200
-        else:
-            return '', 200 
-    
-    # if __name__ == '__main__':
-    #     app.run(host='0.0.0.0', port=SERVER_PORT, debug=True)
-    pass
-else:
-    print("WARNING: BOT_TOKEN or WEBHOOK_URL_BASE not set. Bot running in polling mode (for local test only).")
+            # Set webhook on every access to the root path to ensure persistence
+            bot.set_webhook(url=webhook_url)
+            print(f"Webhook successfully set to: {webhook_url}")
+            return f"RoutAfare Bot running. Webhook set to: {webhook_url}", 200
+        except Exception as e:
+            print(f"Failed to set webhook: {e}")
+            return f"Failed to set webhook. Check logs. Error: {e}", 500
+    return "RoutAfare Bot Flask app is running, but configuration is incomplete.", 200
