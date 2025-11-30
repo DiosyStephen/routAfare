@@ -2,10 +2,8 @@
 """
 routAfare_botFINAL.py
 Integrated Version using Render's PostgreSQL for data persistence.
-- Replaces Firestore with synchronous PostgreSQL connection (using psycopg2).
-- Assumes DATABASE_URL is set in the environment (standard for Render).
-- Vertex AI is kept as optional, relying on the environment variables for initialization.
-- FIXED: Application startup logic added to run the Flask server for webhooks.
+- Includes a fix in the Flask webhook handler to ensure pyTelegramBotAPI correctly processes updates.
+- NEW FEATURES: Bus Type, Total Seats, Seat Management (Deduction), Passenger Count, and Total Predicted Fare.
 """
 
 import os
@@ -48,7 +46,6 @@ PROVIDER_PASSWORD = os.getenv('PROVIDER_PASSWORD')
 DATABASE_URL = os.getenv('DATABASE_URL')
 PROJECT_ID = os.getenv('PROJECT_ID')
 MODEL_ENDPOINT_ID = os.getenv('MODEL_ENDPOINT_ID')
-SERVER_PORT = int(os.getenv('PORT', 5000)) # Default to 5000 for local runs
 
 # --- Globals and Bot Setup ---
 WEBHOOK_URL_PATH = f"/{BOT_TOKEN}"
@@ -69,7 +66,7 @@ def get_sync_db_connection(dict_cursor=False):
         return None
 
 def setup_database_schema():
-    """Initializes the database schema if tables do not exist."""
+    """Initializes the database schema if tables do not exist, and includes new seat fields."""
     conn = get_sync_db_connection()
     if not conn:
         return
@@ -77,7 +74,7 @@ def setup_database_schema():
     try:
         cur = conn.cursor()
         
-        # 1. Bus Services Table (Stores public and private bus info)
+        # 1. Bus Services Table (Updated with bus_type, total_seats, and available_seats)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS bus_services (
                 id SERIAL PRIMARY KEY,
@@ -88,6 +85,9 @@ def setup_database_schema():
                 contact_number TEXT,
                 departure_time_slot TEXT NOT NULL, -- e.g., '06:00-07:00'
                 status TEXT DEFAULT 'active', -- 'active' or 'unavailable'
+                bus_type TEXT, 
+                total_seats INTEGER DEFAULT 50,
+                available_seats INTEGER DEFAULT 50, -- Defaults to total_seats on creation
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
         """)
@@ -100,6 +100,7 @@ def setup_database_schema():
                 bus_id INTEGER REFERENCES bus_services(id),
                 route TEXT NOT NULL,
                 time_slot TEXT NOT NULL,
+                passenger_count INTEGER NOT NULL, -- Store how many seats were booked
                 booking_time TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
         """)
@@ -111,14 +112,14 @@ def setup_database_schema():
         if count == 0:
             print("Inserting initial public bus data...")
             initial_services = [
-                ('Badulla-Kandy', 'Public Bus', 'Govt Driver 1', 150.00, '0771234567', '06:00-07:00'),
-                ('Badulla-Kandy', 'Public Bus', 'Govt Driver 2', 155.00, '0772345678', '08:00-09:00'),
-                ('Badulla-Kandy', 'Public Bus', 'Govt Driver 3', 145.00, '0773456789', '12:00-13:00'),
+                ('Badulla-Kandy', 'Public Bus', 'Govt Driver 1', 150.00, '0771234567', '06:00-07:00', 'Standard', 45, 45),
+                ('Badulla-Kandy', 'Public Bus', 'Govt Driver 2', 155.00, '0772345678', '08:00-09:00', 'Semi-Luxury', 40, 40),
+                ('Badulla-Kandy', 'Public Bus', 'Govt Driver 3', 145.00, '0773456789', '12:00-13:00', 'Standard', 50, 50),
             ]
             
             insert_query = """
-                INSERT INTO bus_services (route, service_name, driver_name, fare_price, contact_number, departure_time_slot)
-                VALUES (%s, %s, %s, %s, %s, %s);
+                INSERT INTO bus_services (route, service_name, driver_name, fare_price, contact_number, departure_time_slot, bus_type, total_seats, available_seats)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
             """
             cur.executemany(insert_query, initial_services)
             print("Initial public bus data inserted.")
@@ -139,6 +140,9 @@ setup_database_schema()
 def get_departure_time_slot(time_str):
     """Converts HH:MM string to a 1-hour time slot string (e.g., '07:00' -> '07:00-08:00')."""
     try:
+        if '-' in time_str:
+             return time_str
+             
         hour = int(time_str.split(':')[0])
         start_time = f"{hour:02d}:00"
         end_time = f"{(hour + 1) % 24:02d}:00"
@@ -147,7 +151,8 @@ def get_departure_time_slot(time_str):
         return None
 
 def get_fare_prediction(data):
-    """Placeholder for Vertex AI prediction or simple fallback."""
+    """Placeholder for Vertex AI prediction or simple fallback (Base fare per person)."""
+    # This is the base fare (for one person)
     default_fare = 150.00
     estimated_fare = default_fare
 
@@ -186,10 +191,12 @@ def sync_add_service(data):
         time_slot = get_departure_time_slot(data['departure_time'])
         if not time_slot: raise ValueError("Invalid departure time format.")
             
+        # available_seats is set equal to total_seats on creation
         insert_query = """
             INSERT INTO bus_services (
-                route, service_name, driver_name, fare_price, contact_number, departure_time_slot
-            ) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id;
+                route, service_name, driver_name, fare_price, contact_number, departure_time_slot,
+                bus_type, total_seats, available_seats
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
         """
         
         cur.execute(insert_query, (
@@ -198,7 +205,10 @@ def sync_add_service(data):
             data['driver_name'], 
             data['fare_price'], 
             data['contact_number'],
-            time_slot
+            time_slot,
+            data['bus_type'],
+            data['total_seats'],
+            data['total_seats'] # available_seats = total_seats
         ))
         
         bus_id = cur.fetchone()[0]
@@ -219,7 +229,6 @@ def sync_update_service(service_id, update_data):
     try:
         cur = conn.cursor()
         
-        # Build dynamic SET clause
         set_parts = []
         data_values = []
         for key, value in update_data.items():
@@ -247,7 +256,7 @@ def sync_get_all_services(user_id=None):
 
     try:
         cur = conn.cursor()
-        cur.execute("SELECT id, route, service_name, driver_name, fare_price, departure_time_slot, status FROM bus_services ORDER BY created_at DESC;")
+        cur.execute("SELECT id, route, service_name, driver_name, fare_price, departure_time_slot, status, bus_type, available_seats FROM bus_services ORDER BY created_at DESC;")
         
         results = cur.fetchall()
         cur.close()
@@ -256,7 +265,7 @@ def sync_get_all_services(user_id=None):
         for row in results:
             service = dict(row) 
             if service['fare_price'] is not None:
-                 service['fare_price'] = str(service['fare_price'])
+                 service['fare_price'] = str(service['fare_price']) 
             services_list.append(service)
 
         return {'services': services_list}
@@ -268,9 +277,10 @@ def sync_get_all_services(user_id=None):
 
 # --- DB Sync Operations (Passenger Logic) ---
 
-def sync_search_matching_services(route, time_slot_str):
+def sync_search_matching_services(route, time_slot_str, passenger_count):
     """
-    Searches the database for all active bus services matching the route and time slot.
+    Searches the database for all active bus services matching the route, time slot,
+    and ensuring enough available seats.
     """
     time_slot = get_departure_time_slot(time_slot_str)
     if not time_slot:
@@ -282,14 +292,16 @@ def sync_search_matching_services(route, time_slot_str):
     try:
         cur = conn.cursor()
         
-        # This query retrieves ALL active services matching the route and time slot.
         sql_query = """
-            SELECT id, route, service_name, fare_price, departure_time_slot
+            SELECT id, route, service_name, fare_price, departure_time_slot, bus_type, available_seats
             FROM bus_services
-            WHERE route = %s AND departure_time_slot = %s AND status = 'active'; 
+            WHERE route = %s 
+              AND departure_time_slot = %s 
+              AND status = 'active'
+              AND available_seats >= %s;
         """
         
-        cur.execute(sql_query, (route, time_slot))
+        cur.execute(sql_query, (route, time_slot, passenger_count))
         
         results = cur.fetchall()
         cur.close()
@@ -309,26 +321,41 @@ def sync_search_matching_services(route, time_slot_str):
     finally:
         if conn: conn.close()
 
-def sync_save_booking(user_id, bus_id, route, time_slot):
-    """Saves a successful booking to the database."""
+def sync_save_booking(user_id, bus_id, route, time_slot, passenger_count):
+    """
+    Saves a successful booking and deducts seats from the bus_services table.
+    Returns the number of remaining seats after booking.
+    """
     conn = get_sync_db_connection()
-    if not conn: return False
+    if not conn: return None
 
     try:
         cur = conn.cursor()
         
-        insert_query = """
-            INSERT INTO bookings (user_id, bus_id, route, time_slot)
-            VALUES (%s, %s, %s, %s);
+        # 1. Deduct seats and get the new available count
+        update_seats_query = """
+            UPDATE bus_services 
+            SET available_seats = available_seats - %s 
+            WHERE id = %s 
+            RETURNING available_seats;
         """
+        cur.execute(update_seats_query, (passenger_count, bus_id))
         
-        cur.execute(insert_query, (user_id, bus_id, route, time_slot))
+        remaining_seats = cur.fetchone()[0]
+        
+        # 2. Insert booking record
+        insert_booking_query = """
+            INSERT INTO bookings (user_id, bus_id, route, time_slot, passenger_count)
+            VALUES (%s, %s, %s, %s, %s);
+        """
+        cur.execute(insert_booking_query, (user_id, bus_id, route, time_slot, passenger_count))
+        
         conn.commit()
         cur.close()
-        return True
+        return remaining_seats
     except Exception as e:
-        print(f"Error saving booking: {e}")
-        return False
+        print(f"Error saving booking/deducting seats: {e}")
+        return None
     finally:
         if conn: conn.close()
 
@@ -339,7 +366,8 @@ def send_welcome(message):
     """Handles the /start command and asks the user for their role."""
     chat_id = message.chat.id
     user_states[chat_id] = {'stage': 'AWAITING_ROLE'}
-
+    print(f"Processing /start for user {chat_id}") 
+    
     markup = telebot.types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True, one_time_keyboard=True)
     item_passenger = telebot.types.KeyboardButton('🧑 Passenger')
     item_provider = telebot.types.KeyboardButton('🚌 Bus Provider')
@@ -379,64 +407,92 @@ def handle_passenger_route(message):
 
 @bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_TIME_PASSENGER')
 def handle_passenger_time(message):
-    """Processes time, searches buses, and presents booking options."""
+    """Saves the time and asks for passenger count."""
     chat_id = message.chat.id
     time_str = message.text.strip()
     
     try:
-        # Basic time validation
         datetime.strptime(time_str, '%H:%M')
-        
         user_states[chat_id]['departure_time'] = time_str
+        user_states[chat_id]['stage'] = 'AWAITING_PASSENGER_COUNT'
+        bot.send_message(chat_id, "🔢 How many seats do you need to book? (Enter a number, e.g., 2):")
+        
+    except ValueError:
+        bot.send_message(chat_id, "❌ Invalid time format. Please enter time in HH:MM (e.g., 07:00).")
+        
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_PASSENGER_COUNT')
+def handle_passenger_count(message):
+    """Processes passenger count, searches buses, and presents booking options."""
+    chat_id = message.chat.id
+    
+    try:
+        passenger_count = int(message.text.strip())
+        if passenger_count <= 0 or passenger_count > 50: # Arbitrary upper limit
+            raise ValueError("Invalid count")
+
+        user_states[chat_id]['passenger_count'] = passenger_count
         route = user_states[chat_id]['route']
+        time_str = user_states[chat_id]['departure_time']
         
         bot.send_message(chat_id, "Calculating fare and searching for matching services... 🔍")
         
-        # 1. Get Estimated Fare (This serves as the predicted fare for all passengers)
+        # 1. Get Estimated Base Fare (per person)
         fare_data = {'route': route, 'time': time_str} 
-        estimated_fare = get_fare_prediction(fare_data) # Total predicted fare for the group/search
+        estimated_base_fare = get_fare_prediction(fare_data)
+        total_predicted_fare = estimated_base_fare * passenger_count
         
-        # 2. Search for Buses
-        matching_buses = sync_search_matching_services(route, time_str)
+        # 2. Search for Buses (with enough available seats)
+        matching_buses = sync_search_matching_services(route, time_str, passenger_count)
         
         if not matching_buses:
-            bot.send_message(chat_id, f"😥 No active bus services found for Route: **{route}** around **{time_str}**.", parse_mode='Markdown')
+            bot.send_message(chat_id, f"😥 No active bus services found with **{passenger_count} or more seats** for Route: **{route}** around **{time_str}**.", parse_mode='Markdown')
             user_states[chat_id] = {} # End session
             return
 
         # 3. Prepare Display and Keyboard
         departure_slot = get_departure_time_slot(time_str)
         
-        # Display the Total Predicted Bus Fare
         summary_text = (
             f"🚌 **Your Search Summary**\n"
             f"Route: **{route}**\n"
-            f"Time: **{time_str}** (Slot: {departure_slot})\n"
-            f"Total Predicted Bus Fare: Rs\\ **{estimated_fare:.2f}**\n\n"
+            f"Time Slot: **{departure_slot}**\n"
+            f"Seats Requested: **{passenger_count}**\n"
+            f"Total Predicted Fare (approx): Rs\\ **{total_predicted_fare:.2f}**\n\n"
             "Select a service to Confirm Booking:"
         )
         
         markup = InlineKeyboardMarkup()
         
         for bus in matching_buses:
-            callback_data = f"book_{bus['id']}" 
-            # Use the actual fare if available, otherwise use the predicted fare
-            fare_display = f"Rs. {bus['fare_price']}" if bus.get('fare_price') else f"~Rs. {estimated_fare:.2f}"
+            # Pass bus_id and passenger_count in callback data
+            callback_data = f"book_{bus['id']}_{passenger_count}" 
             
-            button_text = f"✅ Book: {bus['service_name']} | Fare: {fare_display}"
+            # Calculate total fare if bus has a fixed fare_price, otherwise use estimated
+            bus_fare = float(bus['fare_price']) if bus.get('fare_price') else estimated_base_fare
+            total_bus_fare = bus_fare * passenger_count
+            
+            fare_display = f"Rs. {total_bus_fare:.2f}"
+            
+            # Display Bus Type and Available Seats
+            button_text = (
+                f"✅ Book: {bus['service_name']} ({bus.get('bus_type', 'N/A')}) | "
+                f"Seats: {bus['available_seats']} available | Total Fare: {fare_display}"
+            )
             
             markup.add(InlineKeyboardButton(text=button_text, callback_data=callback_data))
 
         user_states[chat_id]['stage'] = 'AWAITING_BOOKING_CONFIRMATION'
         user_states[chat_id]['buses'] = matching_buses
+        user_states[chat_id]['estimated_base_fare'] = estimated_base_fare # Store for fallback calculation
         
         bot.send_message(chat_id, summary_text, reply_markup=markup, parse_mode='Markdown')
 
     except ValueError:
-        bot.send_message(chat_id, "❌ Invalid time format. Please enter time in HH:MM (e.g., 07:00).")
+        bot.send_message(chat_id, "❌ Invalid seat count. Please enter a positive whole number.")
+        user_states[chat_id]['stage'] = 'AWAITING_PASSENGER_COUNT' # Revert stage
         
     except Exception as e:
-        print(f"Error in passenger search: {e}")
+        print(f"Error in passenger count/search: {e}")
         bot.send_message(chat_id, "An unexpected error occurred during search. Please try again.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('book_'))
@@ -448,56 +504,56 @@ def handle_booking_callback(call):
         bot.answer_callback_query(call.id, "Session expired. Please start over with /start.")
         return
         
-    bus_id = int(call.data.split('_')[1])
-    
+    # Split the callback data: book_BUSID_PASSENGERCOUNT
+    try:
+        _, bus_id_str, passenger_count_str = call.data.split('_')
+        bus_id = int(bus_id_str)
+        passenger_count = int(passenger_count_str)
+    except ValueError:
+        bot.answer_callback_query(call.id, "Error processing booking data.")
+        user_states[chat_id] = {}
+        return
+
+    # Find the bus details from the stored state
     selected_bus = next((b for b in user_states[chat_id]['buses'] if b['id'] == bus_id), None)
 
     if selected_bus:
         route = user_states[chat_id]['route']
         time_slot = selected_bus['departure_time_slot']
         
-        # *** SEAT/AVAILABILITY MANAGEMENT (Placeholder for final requirements) ***
-        # Since the database schema provided does not track remaining seats, 
-        # we will simulate the final availability confirmation here.
-        # Assuming one passenger for the basic booking flow.
+        # Save Booking to DB and deduct seats
+        remaining_seats = sync_save_booking(chat_id, bus_id, route, time_slot, passenger_count)
         
-        # Save Booking to DB
-        if sync_save_booking(chat_id, bus_id, route, time_slot):
+        if remaining_seats is not None:
             
-            # 1. Update the original message
+            # Calculate final total fare
+            estimated_base_fare = user_states[chat_id].get('estimated_base_fare', 150.00)
+            bus_fare = float(selected_bus['fare_price']) if selected_bus.get('fare_price') else estimated_base_fare
+            total_final_fare = bus_fare * passenger_count
+            
+            # 1. Update the original message to remove buttons
             try:
                 bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
             except Exception:
                 pass 
 
             # 2. Send confirmation
-            
-            # Total Predicted Fare (Using the estimated fare from the search step for display)
-            fare_data = {'route': route, 'time': user_states[chat_id].get('departure_time')} 
-            total_predicted_fare = get_fare_prediction(fare_data) 
-            
-            # Final Seats Remaining (Simulated, as schema doesn't support live count)
-            # We assume a fixed capacity for now, but in a real system, this would be fetched and decremented.
-            final_seats_remaining = "Simulated: 49" # Placeholder for live deduction
-            
-            fare_display = f"Rs. {selected_bus['fare_price']}" if selected_bus.get('fare_price') else f"Rs. {total_predicted_fare:.2f} (Estimated)"
-
             confirmation_text = (
                 "🎉 **BOOKING CONFIRMED!** 🎉\n\n"
-                f"🚍 Service: **{selected_bus['service_name']}**\n"
-                f"💲 **Total Predicted Bus Fare:** {fare_display}\n" # Display total predicted fare
-                f"💺 **Final Seats Remaining:** {final_seats_remaining}\n\n" # Display final remaining seats
+                f"Service: **{selected_bus['service_name']}** ({selected_bus.get('bus_type', 'N/A')})\n"
                 f"Route: **{route}**\n"
+                f"Seats Booked: **{passenger_count}**\n"
+                f"Total Final Fare: Rs\\ **{total_final_fare:.2f}**\n"
                 f"Departure Slot: **{time_slot}**\n\n"
-                "Thank you for using RoutAfare. Please be ready to board at the departure time."
+                f"Seats Remaining on Bus: **{remaining_seats}**"
             )
             bot.send_message(chat_id, confirmation_text, parse_mode='Markdown')
             
         else:
-            bot.send_message(chat_id, "❌ Sorry, there was a problem confirming your booking in the database. Please try again later.")
+            bot.send_message(chat_id, "❌ Sorry, there was a problem confirming your booking and deducting seats. Please try again later.")
 
     user_states[chat_id] = {} # End session
-    bot.answer_callback_query(call.id, "Booking Confirmed!")
+    bot.answer_callback_query(call.id, f"Booking Confirmed for {passenger_count} seats!")
 
 # --- Provider Workflow ---
 
@@ -527,34 +583,26 @@ def handle_provider_menu_dispatch(message):
     
     if text == '➕ Add Service':
         user_states[chat_id]['stage'] = 'AWAITING_ROUTE_NAME'
-        # Clear keyboard
         markup = telebot.types.ReplyKeyboardRemove(selective=False)
-        bot.send_message(chat_id, "Enter the Route Name (e.g., Kandy-Colombo):", reply_markup=markup)
+        bot.send_message(chat_id, "Enter the **Route Name** (e.g., Kandy-Colombo):", reply_markup=markup, parse_mode='Markdown')
     elif text == '⚙️ Manage Status':
-        prov_status(message) # Call the handler function directly
+        prov_status(message) 
     else:
         bot.send_message(chat_id, "Please use the buttons provided.")
 
 
-# --- Provider Service Details Collection ---
+# --- Provider Service Details Collection (Updated with Bus Type and Total Seats) ---
 
 @bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_ROUTE_NAME')
 def handle_provider_route_name(message):
     chat_id = message.chat.id
     user_states[chat_id]['route'] = message.text.strip()
-    user_states[chat_id]['stage'] = 'AWAITING_BUS_TYPE' # New step added here
-    bot.send_message(chat_id, "🚌 Enter the **Bus Type** (e.g., Luxury, Semi-Luxury, Normal):", parse_mode='Markdown')
-
-@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_BUS_TYPE')
-def handle_provider_bus_type(message):
-    chat_id = message.chat.id
-    user_states[chat_id]['bus_type'] = message.text.strip() # New field stored
-    user_states[chat_id]['stage'] = 'AWAITING_SERVICE_NAME' 
+    user_states[chat_id]['stage'] = 'AWAITING_SERVICE_NAME'
     bot.send_message(chat_id, "Enter the **Bus Service/Company Name** (e.g., Starline Express, Private Bus):", parse_mode='Markdown')
 
 @bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_SERVICE_NAME')
 def handle_provider_service_name(message):
-    chat_id = message.chat.id 
+    chat_id = message.chat.id
     user_states[chat_id]['service_name'] = message.text.strip()
     user_states[chat_id]['stage'] = 'AWAITING_DRIVER_NAME'
     bot.send_message(chat_id, "Enter **Driver Name**:")
@@ -563,21 +611,8 @@ def handle_provider_service_name(message):
 def handle_provider_driver_name(message):
     chat_id = message.chat.id
     user_states[chat_id]['driver_name'] = message.text.strip()
-    user_states[chat_id]['stage'] = 'AWAITING_SEAT_COUNT' # New step: Seat Count
-    bot.send_message(chat_id, "💺 Enter the **Total Number of Seats** available (e.g., 50):", parse_mode='Markdown')
-
-@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_SEAT_COUNT')
-def handle_provider_seat_count(message):
-    chat_id = message.chat.id
-    try:
-        seats = int(message.text.strip())
-        if seats <= 0: raise ValueError
-        user_states[chat_id]['total_seats'] = seats # Storing total seats
-        # Note: 'remaining_seats' logic should be added to the DB schema and sync_add_service
-        user_states[chat_id]['stage'] = 'AWAITING_FARE_PRICE'
-        bot.send_message(chat_id, "💵 Enter **Fare Price** (e.g., 150.00):", parse_mode='Markdown')
-    except ValueError:
-        bot.send_message(chat_id, "❌ Invalid number of seats. Please enter a positive whole number.")
+    user_states[chat_id]['stage'] = 'AWAITING_FARE_PRICE'
+    bot.send_message(chat_id, "Enter **Fare Price (per person)** (e.g., 150.00):")
 
 @bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_FARE_PRICE')
 def handle_provider_fare_price(message):
@@ -589,7 +624,7 @@ def handle_provider_fare_price(message):
         fare = float(message.text.strip())
         user_states[chat_id]['fare_price'] = fare
         user_states[chat_id]['stage'] = 'AWAITING_CONTACT_NUMBER'
-        bot.send_message(chat_id, "📞 Enter **Contact Number** (e.g., 071-XXX-XXXX):", parse_mode='Markdown')
+        bot.send_message(chat_id, "Enter **Contact Number** (e.g., 071-XXX-XXXX):")
     except ValueError:
         bot.send_message(chat_id, "❌ Invalid fare format. Please enter a valid number (e.g., 150.00).")
 
@@ -603,8 +638,32 @@ def handle_provider_contact_number(message):
         return
         
     user_states[chat_id]['contact_number'] = contact
-    user_states[chat_id]['stage'] = 'AWAITING_DEPARTURE_TIME'
-    bot.send_message(chat_id, "⏰ Enter **Departure Time** in HH:MM (e.g., 06:30):", parse_mode='Markdown')
+    user_states[chat_id]['stage'] = 'AWAITING_BUS_TYPE' # NEW STEP
+    bot.send_message(chat_id, "Enter **Bus Type** (e.g., Standard, Semi-Luxury, AC):")
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_BUS_TYPE')
+def handle_provider_bus_type(message):
+    chat_id = message.chat.id
+    user_states[chat_id]['bus_type'] = message.text.strip()
+    user_states[chat_id]['stage'] = 'AWAITING_TOTAL_SEATS' # NEW STEP
+    bot.send_message(chat_id, "Enter **Total Number of Seats** on the bus (e.g., 45):")
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_TOTAL_SEATS')
+def handle_provider_total_seats(message):
+    chat_id = message.chat.id
+    
+    try:
+        total_seats = int(message.text.strip())
+        if total_seats <= 0 or total_seats > 100:
+             raise ValueError("Invalid seat count")
+             
+        user_states[chat_id]['total_seats'] = total_seats
+        user_states[chat_id]['stage'] = 'AWAITING_DEPARTURE_TIME'
+        bot.send_message(chat_id, "Enter **Departure Time** in HH:MM (e.g., 06:30):")
+        
+    except ValueError:
+        bot.send_message(chat_id, "❌ Invalid seat count. Please enter a positive whole number.")
+
 
 @bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_DEPARTURE_TIME')
 def handle_provider_departure_time(message):
@@ -615,18 +674,16 @@ def handle_provider_departure_time(message):
         datetime.strptime(time_str, '%H:%M')
         user_states[chat_id]['departure_time'] = time_str
         
-        # Prepare data for insertion (including placeholders for bus_type and seats)
+        # Collect all data points including new ones
         service_data = {
             'route': user_states[chat_id]['route'],
             'service_name': user_states[chat_id]['service_name'],
             'driver_name': user_states[chat_id]['driver_name'],
             'fare_price': user_states[chat_id]['fare_price'],
             'contact_number': user_states[chat_id]['contact_number'],
-            'departure_time': time_str,
-            # Note: bus_type and seats are currently not stored due to initial schema, 
-            # but their inputs are now collected in the user_states dict.
-            'bus_type': user_states[chat_id].get('bus_type', 'N/A'),
-            'total_seats': user_states[chat_id].get('total_seats', 'N/A')
+            'bus_type': user_states[chat_id]['bus_type'],
+            'total_seats': user_states[chat_id]['total_seats'],
+            'departure_time': time_str 
         }
         
         bus_id = sync_add_service(service_data)
@@ -635,11 +692,12 @@ def handle_provider_departure_time(message):
             time_slot = get_departure_time_slot(time_str)
             confirmation_text = (
                 "✅ **Service Added Successfully!**\n\n"
-                f"Route: **{service_data['route']}**\n"
                 f"Service: **{service_data['service_name']}** (ID: {bus_id})\n"
-                f"Bus Type: **{service_data['bus_type']}** | Seats: **{service_data['total_seats']}**\n" # Displaying new fields
+                f"Bus Type: **{service_data['bus_type']}**\n"
+                f"Total Seats: **{service_data['total_seats']}** (All available)\n"
+                f"Route: **{service_data['route']}**\n"
                 f"Time Slot: **{time_slot}**\n"
-                f"Fare: Rs\\ **{service_data['fare_price']:.2f}**"
+                f"Fare (Per Person): Rs\\ **{service_data['fare_price']:.2f}**"
             )
             bot.send_message(chat_id, confirmation_text, parse_mode='Markdown')
         else:
@@ -668,33 +726,34 @@ def prov_status(message):
     """Displays the list of services with buttons to toggle their status."""
     chat_id = message.chat.id
     
-    # 1. Fetch all services
     services_db = sync_get_all_services()
     services = services_db.get('services', [])
     
-    # Clear the menu keyboard only if there are services to manage
     if services:
         markup = telebot.types.ReplyKeyboardRemove(selective=False)
-        # Send a placeholder message to trigger the removal of the old keyboard
         bot.send_message(chat_id, "Fetching services...", reply_markup=markup) 
     else:
         bot.send_message(chat_id, "No services have been registered yet.")
         return
 
-    # 2. Build the inline keyboard for status toggling
     status_markup = InlineKeyboardMarkup()
     
     for svc in services:
         status = svc.get('status', 'active')
         emoji = "🟢" if status == 'active' else "🔴"
         
+        # Include available seats in the status display
+        display_text = (
+            f"{emoji} {svc['service_name']} ({svc['route']}) | "
+            f"Seats: {svc['available_seats']} available | Status: {status.upper()}"
+        )
+        
         toggle_button = InlineKeyboardButton(
-            text=f"{emoji} {svc['service_name']} ({svc['route']}) | Status: {status.upper()}",
+            text=display_text,
             callback_data=f"toggle_status_{svc['id']}"
         )
         status_markup.add(toggle_button)
 
-    # 3. Send the updated status message
     bot.send_message(
         chat_id,
         "**Toggle Service Status:**\n\nTap a button to switch the service between ACTIVE (available for booking) and UNAVAILABLE.",
@@ -709,27 +768,21 @@ def handle_status_toggle(call):
     chat_id = call.message.chat.id
     s_id = int(call.data.split('_')[-1])
 
-    # 1. Fetch current status
     services_db = sync_get_all_services()
     svc = next((s for s in services_db['services'] if s['id'] == s_id), None)
     
     if svc:
-        # 2. Determine new status
         new_status = 'unavailable' if svc.get('status') == 'active' else 'active'
         
-        # 3. Update Postgres table
         sync_update_service(s_id, {'status': new_status})
         
-        # 4. Refresh the status menu by sending the prov_status message again
-        
-        # Edit the original message to remove the old inline keyboard
         try:
             bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
-            bot.edit_message_text(f"Updating status for {svc['service_name']}...", chat_id, call.message.message_id)
+            bot.edit_message_text(f"Status for {svc['service_name']} updated to {new_status.upper()}.", chat_id, call.message.message_id)
         except Exception:
             pass
         
-        # Re-send the status menu message
+        # Re-display the status list
         prov_status(call.message) 
         bot.answer_callback_query(call.id, f"Status set to {new_status.upper()}")
         
@@ -744,14 +797,23 @@ app = Flask(__name__)
 
 @app.route(WEBHOOK_URL_PATH, methods=['POST'])
 def webhook():
-    """Receives updates from Telegram and passes them to the bot."""
+    """Receives updates from Telegram and passes them to the bot.
+    CRITICAL FIX: Explicitly uses bot.process_new_updates and includes error handling.
+    """
     if request.headers.get('content-type') == 'application/json':
         json_string = request.get_data().decode('utf-8')
         update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
+        
+        # --- FIX APPLIED HERE ---
+        try:
+            # Pass the update object to the bot for processing
+            bot.process_new_updates([update])
+        except Exception as e:
+            print(f"Error processing update in webhook: {e}") 
+            
         return '!', 200
     else:
-        return '', 200 
+        return 'Invalid request format', 200 
 
 @app.route('/')
 def index():
@@ -759,19 +821,10 @@ def index():
     if BOT_TOKEN and WEBHOOK_URL_BASE:
         webhook_url = f"{WEBHOOK_URL_BASE}{WEBHOOK_URL_PATH}"
         try:
-            # Set webhook on every access to the root path to ensure persistence
-            bot.set_webhook(url=webhook_url) 
+            bot.set_webhook(url=webhook_url)
             print(f"Webhook successfully set to: {webhook_url}")
             return f"RoutAfare Bot running. Webhook set to: {webhook_url}", 200
         except Exception as e:
             print(f"Failed to set webhook: {e}")
             return f"Failed to set webhook. Check logs. Error: {e}", 500
     return "RoutAfare Bot Flask app is running, but configuration is incomplete.", 200
-
-# --- CRITICAL FIX: APPLICATION RUNTIME ---
-
-if __name__ == '__main__':
-    # This block is essential for local testing. It starts the Flask web server 
-    # to listen for the Telegram webhooks, resolving the "Telegram API not opening" issue.
-    print(f"Starting Flask server on port {SERVER_PORT}...")
-    app.run(host='0.0.0.0', port=SERVER_PORT)
