@@ -2,7 +2,10 @@
 """
 routAfare_botFINAL.py
 Integrated Version using Render's PostgreSQL for data persistence.
-- Includes a fix in the Flask webhook handler to ensure pyTelegramBotAPI correctly processes updates.
+- Replaces Firestore with synchronous PostgreSQL connection (using psycopg2).
+- Assumes DATABASE_URL is set in the environment (standard for Render).
+- Vertex AI is kept as optional, relying on the environment variables for initialization.
+- FIXED: Application startup logic added to run the Flask server for webhooks.
 """
 
 import os
@@ -45,6 +48,7 @@ PROVIDER_PASSWORD = os.getenv('PROVIDER_PASSWORD')
 DATABASE_URL = os.getenv('DATABASE_URL')
 PROJECT_ID = os.getenv('PROJECT_ID')
 MODEL_ENDPOINT_ID = os.getenv('MODEL_ENDPOINT_ID')
+SERVER_PORT = int(os.getenv('PORT', 5000)) # Default to 5000 for local runs
 
 # --- Globals and Bot Setup ---
 WEBHOOK_URL_PATH = f"/{BOT_TOKEN}"
@@ -135,10 +139,6 @@ setup_database_schema()
 def get_departure_time_slot(time_str):
     """Converts HH:MM string to a 1-hour time slot string (e.g., '07:00' -> '07:00-08:00')."""
     try:
-        # Check if the input is already a slot (in case it was called twice)
-        if '-' in time_str:
-             return time_str
-             
         hour = int(time_str.split(':')[0])
         start_time = f"{hour:02d}:00"
         end_time = f"{(hour + 1) % 24:02d}:00"
@@ -256,8 +256,7 @@ def sync_get_all_services(user_id=None):
         for row in results:
             service = dict(row) 
             if service['fare_price'] is not None:
-                 # Convert Decimal to string for Telegram display
-                 service['fare_price'] = str(service['fare_price']) 
+                 service['fare_price'] = str(service['fare_price'])
             services_list.append(service)
 
         return {'services': services_list}
@@ -283,6 +282,7 @@ def sync_search_matching_services(route, time_slot_str):
     try:
         cur = conn.cursor()
         
+        # This query retrieves ALL active services matching the route and time slot.
         sql_query = """
             SELECT id, route, service_name, fare_price, departure_time_slot
             FROM bus_services
@@ -339,8 +339,7 @@ def send_welcome(message):
     """Handles the /start command and asks the user for their role."""
     chat_id = message.chat.id
     user_states[chat_id] = {'stage': 'AWAITING_ROLE'}
-    print(f"Processing /start for user {chat_id}") # Debug print
-    
+
     markup = telebot.types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True, one_time_keyboard=True)
     item_passenger = telebot.types.KeyboardButton('🧑 Passenger')
     item_provider = telebot.types.KeyboardButton('🚌 Bus Provider')
@@ -393,9 +392,9 @@ def handle_passenger_time(message):
         
         bot.send_message(chat_id, "Calculating fare and searching for matching services... 🔍")
         
-        # 1. Get Estimated Fare
+        # 1. Get Estimated Fare (This serves as the predicted fare for all passengers)
         fare_data = {'route': route, 'time': time_str} 
-        estimated_fare = get_fare_prediction(fare_data)
+        estimated_fare = get_fare_prediction(fare_data) # Total predicted fare for the group/search
         
         # 2. Search for Buses
         matching_buses = sync_search_matching_services(route, time_str)
@@ -408,11 +407,12 @@ def handle_passenger_time(message):
         # 3. Prepare Display and Keyboard
         departure_slot = get_departure_time_slot(time_str)
         
+        # Display the Total Predicted Bus Fare
         summary_text = (
             f"🚌 **Your Search Summary**\n"
             f"Route: **{route}**\n"
             f"Time: **{time_str}** (Slot: {departure_slot})\n"
-            f"Estimated Fare: Rs\\ **{estimated_fare:.2f}**\n\n"
+            f"Total Predicted Bus Fare: Rs\\ **{estimated_fare:.2f}**\n\n"
             "Select a service to Confirm Booking:"
         )
         
@@ -420,6 +420,7 @@ def handle_passenger_time(message):
         
         for bus in matching_buses:
             callback_data = f"book_{bus['id']}" 
+            # Use the actual fare if available, otherwise use the predicted fare
             fare_display = f"Rs. {bus['fare_price']}" if bus.get('fare_price') else f"~Rs. {estimated_fare:.2f}"
             
             button_text = f"✅ Book: {bus['service_name']} | Fare: {fare_display}"
@@ -455,6 +456,11 @@ def handle_booking_callback(call):
         route = user_states[chat_id]['route']
         time_slot = selected_bus['departure_time_slot']
         
+        # *** SEAT/AVAILABILITY MANAGEMENT (Placeholder for final requirements) ***
+        # Since the database schema provided does not track remaining seats, 
+        # we will simulate the final availability confirmation here.
+        # Assuming one passenger for the basic booking flow.
+        
         # Save Booking to DB
         if sync_save_booking(chat_id, bus_id, route, time_slot):
             
@@ -465,13 +471,23 @@ def handle_booking_callback(call):
                 pass 
 
             # 2. Send confirmation
-            fare_display = f"Rs. {selected_bus['fare_price']}" if selected_bus.get('fare_price') else "Fare to be confirmed by driver"
+            
+            # Total Predicted Fare (Using the estimated fare from the search step for display)
+            fare_data = {'route': route, 'time': user_states[chat_id].get('departure_time')} 
+            total_predicted_fare = get_fare_prediction(fare_data) 
+            
+            # Final Seats Remaining (Simulated, as schema doesn't support live count)
+            # We assume a fixed capacity for now, but in a real system, this would be fetched and decremented.
+            final_seats_remaining = "Simulated: 49" # Placeholder for live deduction
+            
+            fare_display = f"Rs. {selected_bus['fare_price']}" if selected_bus.get('fare_price') else f"Rs. {total_predicted_fare:.2f} (Estimated)"
 
             confirmation_text = (
                 "🎉 **BOOKING CONFIRMED!** 🎉\n\n"
-                f"Service: **{selected_bus['service_name']}**\n"
+                f"🚍 Service: **{selected_bus['service_name']}**\n"
+                f"💲 **Total Predicted Bus Fare:** {fare_display}\n" # Display total predicted fare
+                f"💺 **Final Seats Remaining:** {final_seats_remaining}\n\n" # Display final remaining seats
                 f"Route: **{route}**\n"
-                f"Fare: **{fare_display}**\n"
                 f"Departure Slot: **{time_slot}**\n\n"
                 "Thank you for using RoutAfare. Please be ready to board at the departure time."
             )
@@ -526,12 +542,19 @@ def handle_provider_menu_dispatch(message):
 def handle_provider_route_name(message):
     chat_id = message.chat.id
     user_states[chat_id]['route'] = message.text.strip()
-    user_states[chat_id]['stage'] = 'AWAITING_SERVICE_NAME'
+    user_states[chat_id]['stage'] = 'AWAITING_BUS_TYPE' # New step added here
+    bot.send_message(chat_id, "🚌 Enter the **Bus Type** (e.g., Luxury, Semi-Luxury, Normal):", parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_BUS_TYPE')
+def handle_provider_bus_type(message):
+    chat_id = message.chat.id
+    user_states[chat_id]['bus_type'] = message.text.strip() # New field stored
+    user_states[chat_id]['stage'] = 'AWAITING_SERVICE_NAME' 
     bot.send_message(chat_id, "Enter the **Bus Service/Company Name** (e.g., Starline Express, Private Bus):", parse_mode='Markdown')
 
 @bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_SERVICE_NAME')
 def handle_provider_service_name(message):
-    chat_id = message.chat.id
+    chat_id = message.chat.id 
     user_states[chat_id]['service_name'] = message.text.strip()
     user_states[chat_id]['stage'] = 'AWAITING_DRIVER_NAME'
     bot.send_message(chat_id, "Enter **Driver Name**:")
@@ -540,8 +563,21 @@ def handle_provider_service_name(message):
 def handle_provider_driver_name(message):
     chat_id = message.chat.id
     user_states[chat_id]['driver_name'] = message.text.strip()
-    user_states[chat_id]['stage'] = 'AWAITING_FARE_PRICE'
-    bot.send_message(chat_id, "Enter **Fare Price** (e.g., 150.00):")
+    user_states[chat_id]['stage'] = 'AWAITING_SEAT_COUNT' # New step: Seat Count
+    bot.send_message(chat_id, "💺 Enter the **Total Number of Seats** available (e.g., 50):", parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_SEAT_COUNT')
+def handle_provider_seat_count(message):
+    chat_id = message.chat.id
+    try:
+        seats = int(message.text.strip())
+        if seats <= 0: raise ValueError
+        user_states[chat_id]['total_seats'] = seats # Storing total seats
+        # Note: 'remaining_seats' logic should be added to the DB schema and sync_add_service
+        user_states[chat_id]['stage'] = 'AWAITING_FARE_PRICE'
+        bot.send_message(chat_id, "💵 Enter **Fare Price** (e.g., 150.00):", parse_mode='Markdown')
+    except ValueError:
+        bot.send_message(chat_id, "❌ Invalid number of seats. Please enter a positive whole number.")
 
 @bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_FARE_PRICE')
 def handle_provider_fare_price(message):
@@ -553,7 +589,7 @@ def handle_provider_fare_price(message):
         fare = float(message.text.strip())
         user_states[chat_id]['fare_price'] = fare
         user_states[chat_id]['stage'] = 'AWAITING_CONTACT_NUMBER'
-        bot.send_message(chat_id, "Enter **Contact Number** (e.g., 071-XXX-XXXX):")
+        bot.send_message(chat_id, "📞 Enter **Contact Number** (e.g., 071-XXX-XXXX):", parse_mode='Markdown')
     except ValueError:
         bot.send_message(chat_id, "❌ Invalid fare format. Please enter a valid number (e.g., 150.00).")
 
@@ -568,7 +604,7 @@ def handle_provider_contact_number(message):
         
     user_states[chat_id]['contact_number'] = contact
     user_states[chat_id]['stage'] = 'AWAITING_DEPARTURE_TIME'
-    bot.send_message(chat_id, "Enter **Departure Time** in HH:MM (e.g., 06:30):")
+    bot.send_message(chat_id, "⏰ Enter **Departure Time** in HH:MM (e.g., 06:30):", parse_mode='Markdown')
 
 @bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_DEPARTURE_TIME')
 def handle_provider_departure_time(message):
@@ -579,13 +615,18 @@ def handle_provider_departure_time(message):
         datetime.strptime(time_str, '%H:%M')
         user_states[chat_id]['departure_time'] = time_str
         
+        # Prepare data for insertion (including placeholders for bus_type and seats)
         service_data = {
             'route': user_states[chat_id]['route'],
             'service_name': user_states[chat_id]['service_name'],
             'driver_name': user_states[chat_id]['driver_name'],
             'fare_price': user_states[chat_id]['fare_price'],
             'contact_number': user_states[chat_id]['contact_number'],
-            'departure_time': time_str 
+            'departure_time': time_str,
+            # Note: bus_type and seats are currently not stored due to initial schema, 
+            # but their inputs are now collected in the user_states dict.
+            'bus_type': user_states[chat_id].get('bus_type', 'N/A'),
+            'total_seats': user_states[chat_id].get('total_seats', 'N/A')
         }
         
         bus_id = sync_add_service(service_data)
@@ -596,6 +637,7 @@ def handle_provider_departure_time(message):
                 "✅ **Service Added Successfully!**\n\n"
                 f"Route: **{service_data['route']}**\n"
                 f"Service: **{service_data['service_name']}** (ID: {bus_id})\n"
+                f"Bus Type: **{service_data['bus_type']}** | Seats: **{service_data['total_seats']}**\n" # Displaying new fields
                 f"Time Slot: **{time_slot}**\n"
                 f"Fare: Rs\\ **{service_data['fare_price']:.2f}**"
             )
@@ -683,7 +725,7 @@ def handle_status_toggle(call):
         # Edit the original message to remove the old inline keyboard
         try:
             bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
-            bot.edit_message_text(f"Status for {svc['service_name']} updated to {new_status.upper()}.", chat_id, call.message.message_id)
+            bot.edit_message_text(f"Updating status for {svc['service_name']}...", chat_id, call.message.message_id)
         except Exception:
             pass
         
@@ -702,26 +744,14 @@ app = Flask(__name__)
 
 @app.route(WEBHOOK_URL_PATH, methods=['POST'])
 def webhook():
-    """Receives updates from Telegram and passes them to the bot.
-    CRITICAL FIX: Explicitly uses bot.process_new_updates and includes error handling.
-    """
+    """Receives updates from Telegram and passes them to the bot."""
     if request.headers.get('content-type') == 'application/json':
         json_string = request.get_data().decode('utf-8')
         update = telebot.types.Update.de_json(json_string)
-        
-        # --- FIX APPLIED HERE ---
-        try:
-            # Pass the update object to the bot for processing
-            bot.process_new_updates([update])
-        except Exception as e:
-            # Important: Catching errors here ensures we always return a 200 OK 
-            # to Telegram, preventing repeated message delivery.
-            print(f"Error processing update in webhook: {e}") 
-            
+        bot.process_new_updates([update])
         return '!', 200
     else:
-        # Handle non-JSON requests gracefully
-        return 'Invalid request format', 200 
+        return '', 200 
 
 @app.route('/')
 def index():
@@ -730,10 +760,18 @@ def index():
         webhook_url = f"{WEBHOOK_URL_BASE}{WEBHOOK_URL_PATH}"
         try:
             # Set webhook on every access to the root path to ensure persistence
-            bot.set_webhook(url=webhook_url)
+            bot.set_webhook(url=webhook_url) 
             print(f"Webhook successfully set to: {webhook_url}")
             return f"RoutAfare Bot running. Webhook set to: {webhook_url}", 200
         except Exception as e:
             print(f"Failed to set webhook: {e}")
             return f"Failed to set webhook. Check logs. Error: {e}", 500
     return "RoutAfare Bot Flask app is running, but configuration is incomplete.", 200
+
+# --- CRITICAL FIX: APPLICATION RUNTIME ---
+
+if __name__ == '__main__':
+    # This block is essential for local testing. It starts the Flask web server 
+    # to listen for the Telegram webhooks, resolving the "Telegram API not opening" issue.
+    print(f"Starting Flask server on port {SERVER_PORT}...")
+    app.run(host='0.0.0.0', port=SERVER_PORT)
