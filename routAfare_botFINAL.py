@@ -2,11 +2,7 @@
 """
 routAfare_botFINAL.py
 Integrated Version using Render's PostgreSQL for data persistence.
-- Replaces Firestore with asynchronous PostgreSQL connection (using psycopg2).
-- Assumes DATABASE_URL is set in the environment (standard for Render).
-- Vertex AI is kept as optional, relying on the environment variables for initialization.
-- FIXED: Passenger search query now includes all services (Public and Private).
-- REFINED: Status management logic now correctly refreshes the menu.
+- Includes a fix in the Flask webhook handler to ensure pyTelegramBotAPI correctly processes updates.
 """
 
 import os
@@ -139,6 +135,10 @@ setup_database_schema()
 def get_departure_time_slot(time_str):
     """Converts HH:MM string to a 1-hour time slot string (e.g., '07:00' -> '07:00-08:00')."""
     try:
+        # Check if the input is already a slot (in case it was called twice)
+        if '-' in time_str:
+             return time_str
+             
         hour = int(time_str.split(':')[0])
         start_time = f"{hour:02d}:00"
         end_time = f"{(hour + 1) % 24:02d}:00"
@@ -256,7 +256,8 @@ def sync_get_all_services(user_id=None):
         for row in results:
             service = dict(row) 
             if service['fare_price'] is not None:
-                 service['fare_price'] = str(service['fare_price'])
+                 # Convert Decimal to string for Telegram display
+                 service['fare_price'] = str(service['fare_price']) 
             services_list.append(service)
 
         return {'services': services_list}
@@ -271,8 +272,6 @@ def sync_get_all_services(user_id=None):
 def sync_search_matching_services(route, time_slot_str):
     """
     Searches the database for all active bus services matching the route and time slot.
-    
-    *** CONFIRMED FIX: No restrictive filter on service_name. ***
     """
     time_slot = get_departure_time_slot(time_slot_str)
     if not time_slot:
@@ -284,7 +283,6 @@ def sync_search_matching_services(route, time_slot_str):
     try:
         cur = conn.cursor()
         
-        # This query retrieves ALL active services matching the route and time slot.
         sql_query = """
             SELECT id, route, service_name, fare_price, departure_time_slot
             FROM bus_services
@@ -341,7 +339,8 @@ def send_welcome(message):
     """Handles the /start command and asks the user for their role."""
     chat_id = message.chat.id
     user_states[chat_id] = {'stage': 'AWAITING_ROLE'}
-
+    print(f"Processing /start for user {chat_id}") # Debug print
+    
     markup = telebot.types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True, one_time_keyboard=True)
     item_passenger = telebot.types.KeyboardButton('🧑 Passenger')
     item_provider = telebot.types.KeyboardButton('🚌 Bus Provider')
@@ -398,7 +397,7 @@ def handle_passenger_time(message):
         fare_data = {'route': route, 'time': time_str} 
         estimated_fare = get_fare_prediction(fare_data)
         
-        # 2. Search for Buses (The fixed query is used here)
+        # 2. Search for Buses
         matching_buses = sync_search_matching_services(route, time_str)
         
         if not matching_buses:
@@ -532,7 +531,7 @@ def handle_provider_route_name(message):
 
 @bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('stage') == 'AWAITING_SERVICE_NAME')
 def handle_provider_service_name(message):
-    chat_id = message.message.chat.id
+    chat_id = message.chat.id
     user_states[chat_id]['service_name'] = message.text.strip()
     user_states[chat_id]['stage'] = 'AWAITING_DRIVER_NAME'
     bot.send_message(chat_id, "Enter **Driver Name**:")
@@ -684,7 +683,7 @@ def handle_status_toggle(call):
         # Edit the original message to remove the old inline keyboard
         try:
             bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
-            bot.edit_message_text(f"Updating status for {svc['service_name']}...", chat_id, call.message.message_id)
+            bot.edit_message_text(f"Status for {svc['service_name']} updated to {new_status.upper()}.", chat_id, call.message.message_id)
         except Exception:
             pass
         
@@ -703,14 +702,26 @@ app = Flask(__name__)
 
 @app.route(WEBHOOK_URL_PATH, methods=['POST'])
 def webhook():
-    """Receives updates from Telegram and passes them to the bot."""
+    """Receives updates from Telegram and passes them to the bot.
+    CRITICAL FIX: Explicitly uses bot.process_new_updates and includes error handling.
+    """
     if request.headers.get('content-type') == 'application/json':
         json_string = request.get_data().decode('utf-8')
         update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
+        
+        # --- FIX APPLIED HERE ---
+        try:
+            # Pass the update object to the bot for processing
+            bot.process_new_updates([update])
+        except Exception as e:
+            # Important: Catching errors here ensures we always return a 200 OK 
+            # to Telegram, preventing repeated message delivery.
+            print(f"Error processing update in webhook: {e}") 
+            
         return '!', 200
     else:
-        return '', 200 
+        # Handle non-JSON requests gracefully
+        return 'Invalid request format', 200 
 
 @app.route('/')
 def index():
